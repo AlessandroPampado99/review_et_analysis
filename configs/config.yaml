@@ -1,0 +1,49 @@
+input:
+  excel_path: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\input\\input_dataset.xlsx"
+  sheet: "input_dataset"
+  header: 0
+  exclude_last_cols: 3
+  flatten_columns: true
+  flatten_sep: " | "
+  flatten_lower: false
+  flatten_strip: true
+  cache_parquet: false         # true just if you want cache
+  cache_path: "C:\\path\\to\\cache\\data.parquet"
+
+pipeline:
+  - step: drop_columns
+    params:
+      names: ["id_to_remove", "notes"]
+
+  - step: coerce_numeric
+    params:
+      columns: ["CAPEX", "OPEX", "lifetime", "efficiency"]
+
+  - step: filter_rows
+    params:
+      query: "CAPEX > 0"
+
+  - step: capex_stats_by_technology
+    params:
+      technology_col: "Technology name"
+      capex_col: "CAPEX"
+      metrics: ["mean", "median", "min", "max", "count", "std"]
+      save_as: "C:\\path\\to\\out\\capex_stats.csv"
+
+  - step: plot_capex_bar_by_technology
+    params:
+      technology_col: "Technology name"
+      value_col: "mean"
+      top_n: 20
+      out_path: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\capex\\capex_mean_by_tech.png"
+
+  - step: plot_capex_gaussian_by_technology
+    params:
+      technology_col: "Technology name"
+      tech_select: ["Hydrogen Gas Storage", "Alkaline  Electrolyzer"]
+      out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\capex\\capex_mean_by_tech.png"
+
+
+output:
+  save_csv: true
+  csv_path: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\final_output.csv"

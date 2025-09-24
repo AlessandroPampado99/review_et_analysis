@@ -1,0 +1,39 @@
+input:
+  excel_path: "C:\\path\\to\\excel_compiled.xlsx"
+  sheet: "Sheet1"
+  header: 0
+  exclude_last_cols: 3
+  flatten_columns: true
+  flatten_sep: " | "
+  flatten_lower: false
+  flatten_strip: true
+  cache_parquet: false         # true just if you want cache
+  cache_path: "C:\\path\\to\\cache\\data.parquet"
+
+pipeline:
+  - step: drop_columns
+    params:
+      names: ["id_to_remove", "notes"]   # to remove if they exist
+
+  - step: filter_rows
+    params:
+      query: "CAPEX > 0"                 
+
+  - step: capex_stats_by_technology
+    params:
+      technology_col: "Technology name"
+      capex_col: "CAPEX"
+      metrics: ["mean", "median", "min", "max", "count"]
+      save_as: "C:\\path\\to\\out\\capex_stats.csv"
+
+  - step: plot_capex_by_technology
+    params:
+      technology_col: "Technology name"
+      capex_col: "CAPEX"
+      agg: "mean"
+      top_n: 20
+      out_path: "C:\\path\\to\\out\\capex_mean_by_tech.png"
+
+output:
+  save_csv: true
+  csv_path: "C:\\path\\to\\out\\final_output.csv"
