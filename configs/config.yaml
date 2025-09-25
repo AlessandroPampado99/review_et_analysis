@@ -57,6 +57,15 @@ pipeline:
       top_n: 30
       out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\efficiency"
 
+# dopo assign_colors_by_technology e stats_by_technology
+  - step: plot_gaussian_by_technology
+    params:
+      stats_source_col: "CAPEX"            # oppure "OPEX", ecc.
+      tech_select: ["all"]                 # oppure: ["PEM  Electrolyzer", "Battery Storage"]
+      # out_dir: "C:\\path\\to\\out\\gaussians_CAPEX"   # opzionale; default auto
+      x_sigma_span: 4.0
+
+
 output:
   save_csv: true
   csv_path: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\final_output.csv"

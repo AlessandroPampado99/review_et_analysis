@@ -339,58 +339,93 @@ def plot_bar_by_technology(
     return df, ctx
 
 
-
-
-@step("plot_capex_gaussian_by_technology")
-def plot_capex_gaussian_by_technology(
+@step("plot_gaussian_by_technology")
+def plot_gaussian_by_technology(
     df: pd.DataFrame,
     ctx: dict,
+    stats_source_col: str,                   # e.g. "CAPEX" or "OPEX"
     technology_col: str = "Technology name",
     mean_col: str = "mean",
     std_col: str = "std",
-    tech_select: Optional[List[str]] = None,  # ["all"] or list
-    out_dir: str = "./out/capex_gaussians",
+    tech_select: Optional[List[str]] = None, # ["all"] or explicit list
+    out_dir: Optional[str] = None,           # default: <base_out_dir>/gaussians_<source>
     x_sigma_span: float = 4.0,
+    tick_labelsize: int = 9,
+    line_width: float = 2.0,
+    cmap_name: str = "tab20",                # used only if no ctx["color_map"]
     **_,
 ):
     """
-    Plot Gaussian curves for CAPEX using mean and std from aggregated stats.
-    One PNG per technology.
+    Plot Gaussian curves using mean/std from ctx['stats'][stats_source_col].
+    One PNG per technology. Colors taken from ctx['color_map'] if available.
     """
-    stats_df = ctx.get("capex_stats", df)
-    for col in [technology_col, mean_col, std_col]:
-        if col not in stats_df.columns:
-            raise KeyError(f"Column '{col}' not found in capex_stats.")
+    logger.info(f"[plot_gaussian_by_technology] source='{stats_source_col}', tech_select={tech_select}")
 
-    # selezione tecnologie
-    if tech_select is None or (len(tech_select) == 1 and tech_select[0].lower() == "all"):
-        tech_list = sorted(stats_df[technology_col].dropna().unique().tolist())
+    # get stats table for the requested source
+    stats_all = ctx.get("stats", {})
+    if stats_source_col not in stats_all:
+        raise KeyError(
+            f"No stats found in ctx for '{stats_source_col}'. "
+            f"Run 'stats_by_technology' including '{stats_source_col}' first."
+        )
+    sdf = stats_all[stats_source_col]
+
+    # validate required columns
+    for col in [technology_col, mean_col, std_col]:
+        if col not in sdf.columns:
+            raise KeyError(f"Column '{col}' required in stats for '{stats_source_col}'.")
+
+    # tech selection
+    if tech_select is None or (len(tech_select) == 1 and str(tech_select[0]).lower() == "all"):
+        tech_list = sorted(sdf[technology_col].dropna().unique().tolist())
     else:
         tech_list = tech_select
 
+    # decide output directory
+    base_out_dir = ctx.get("base_out_dir", "./out")
+    out_dir = out_dir or os.path.join(base_out_dir, f"gaussians_{_slugify(stats_source_col)}")
     _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
 
+    # color map: reuse global if present, else create a consistent local palette
+    color_map = ctx.get("color_map")
+    if not color_map:
+        logger.info("[plot_gaussian_by_technology] No color_map in ctx; creating a temporary palette.")
+        cmap = cm.get_cmap(cmap_name, len(tech_list))
+        color_map = {t: mcolors.to_hex(cmap(i)) for i, t in enumerate(tech_list)}
+        ctx["color_map"] = ctx.get("color_map", {})
+        ctx["color_map"].update(color_map)
+
+    # generate one plot per technology
     for tech in tech_list:
-        row = stats_df[stats_df[technology_col] == tech]
+        row = sdf[sdf[technology_col] == tech]
         if row.empty:
+            logger.warning(f"[plot_gaussian_by_technology] Technology '{tech}' not found in stats table. Skipping.")
             continue
+
         mu = float(row[mean_col].iloc[0])
         sigma = float(row[std_col].iloc[0])
-        if sigma <= 0:
+        if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0:
+            logger.warning(f"[plot_gaussian_by_technology] Non-positive or invalid sigma for '{tech}'. Skipping.")
             continue
 
         xs = np.linspace(mu - x_sigma_span * sigma, mu + x_sigma_span * sigma, 400)
         pdf = (1.0 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((xs - mu) / sigma) ** 2)
 
-        fname = os.path.join(out_dir, f"gaussian_{_slugify(tech)}.png")
-        plt.figure()
-        plt.plot(xs, pdf)
-        plt.xlabel("CAPEX")
-        plt.ylabel("Density")
-        plt.title(f"{tech} — Normal(μ={mu:.2f}, σ={sigma:.2f})")
+        color = color_map.get(tech, "#333333")
+        fname = os.path.join(out_dir, f"gaussian_{_slugify(stats_source_col)}_{_slugify(tech)}.png")
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(xs, pdf, linewidth=line_width, color=color)
+        plt.xlabel(stats_source_col, fontweight="bold")
+        plt.ylabel("Density", fontweight="bold")
+        plt.title(f"{tech} — Normal(μ={mu:.2f}, σ={sigma:.2f})", fontweight="bold")
+        plt.xticks(fontsize=tick_labelsize)
+        plt.yticks(fontsize=tick_labelsize)
         plt.tight_layout()
         plt.savefig(fname, dpi=200)
         plt.close()
+
+        logger.info(f"[plot_gaussian_by_technology] Saved {fname}")
         ctx.setdefault("artifacts", []).append(fname)
 
     return df, ctx
