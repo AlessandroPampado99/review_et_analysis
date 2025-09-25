@@ -119,9 +119,25 @@ def run_pipeline(config: dict):
     Execute the pipeline described by the YAML config.
     Each step function must have signature: (df, ctx, **params) -> (df, ctx)
     """
-    ctx = {"artifacts": []}
+    # Load df
     df = _load_dataframe(config.get("input", {}))
 
+    # Prepare context
+    out_cfg = config.get("output", {})
+    base_out_dir = (
+        out_cfg.get("dir")
+        or (os.path.dirname(out_cfg.get("csv_path")) if out_cfg.get("csv_path") else None)
+        or "./out"
+    )
+
+    ctx = {
+        "artifacts": [],
+        "stats": {},
+        "base_out_dir": base_out_dir,
+        "_original_df": df.copy()  # keep a snapshot of the initial dataframe
+    }
+
+    # Execute pipeline
     for item in config.get("pipeline", []):
         name = item.get("step")
         params = item.get("params", {}) or {}
@@ -130,14 +146,16 @@ def run_pipeline(config: dict):
         fn = STEP_REGISTRY[name]
         df, ctx = fn(df, ctx, **params)
 
-    out_cfg = config.get("output", {})
+    # Save final df if requested
     if out_cfg.get("save_csv", False):
-        csv_path = out_cfg.get("csv_path", "./out/final_output.csv")
+        csv_path = out_cfg.get("csv_path", os.path.join(base_out_dir, "final_output.csv"))
         ensure_parent_dir(csv_path)
         df.to_csv(csv_path, index=False)
         ctx["final_output"] = csv_path
+        ctx["artifacts"].append(csv_path)
 
     return df, ctx
+
 
 
 def run_with_config(config_path: str):

@@ -122,37 +122,70 @@ def group_stats(
     return out, ctx
 
 
-@step("capex_stats_by_technology")
-def capex_stats_by_technology(
+@step("stats_by_technology")
+def stats_by_technology(
     df: pd.DataFrame,
     ctx: dict,
     technology_col: str = "Technology name",
-    capex_col: str = "CAPEX",
-    metrics: Optional[List[str]] = None,
-    save_as: Optional[str] = None,
+    columns: Optional[List[str]] = None,          # e.g. ["CAPEX","OPEX"]
+    metrics: Optional[List[str]] = None,          # e.g. ["mean","median","min","max","count","std"]
+    output_dir: Optional[str] = None,             # default: ctx["base_out_dir"]
+    filename_prefix: str = "statistics",
+    replace_df: bool = False,                     # if True, merge results back and replace df
     **_,
 ):
     """
-    Compute CAPEX stats grouped by Technology name.
-    metrics example: ["mean", "median", "min", "max", "count", "std"]
+    Compute grouped statistics by technology for multiple columns.
+    Saves one CSV per column and stores each table in ctx["stats"][col].
     """
+    if technology_col not in df.columns:
+        raise KeyError(f"Missing technology column: '{technology_col}'")
+
+    columns = columns or []
+    if not columns:
+        return df, ctx
+
     metrics = metrics or ["mean", "median", "min", "max", "count", "std"]
 
-    missing = [c for c in [technology_col, capex_col] if c not in df.columns]
-    if missing:
-        raise KeyError(f"Missing columns for capex_stats_by_technology: {missing}")
+    # Decide output directory
+    base_out_dir = ctx.get("base_out_dir", "./out")
+    out_dir = output_dir or base_out_dir
+    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
 
-    out = df.groupby(technology_col)[capex_col].agg(metrics).reset_index()
+    # Compute stats per column
+    merged = None
+    for col in columns:
+        if col not in df.columns:
+            # skip missing columns gracefully
+            continue
 
-    if save_as:
-        _ensure_parent_dir(save_as)
-        out.to_csv(save_as, index=False)
-        ctx.setdefault("artifacts", []).append(save_as)
+        # groupby & agg
+        out = df.groupby(technology_col)[col].agg(metrics).reset_index()
 
-    # salva anche la tabella in context per gli step successivi
-    ctx["capex_stats"] = out
+        # Save CSV: statistics_<col>.csv
+        slug = _slugify(col)
+        fname = os.path.join(out_dir, f"{filename_prefix}_{slug}.csv")
+        _ensure_parent_dir(fname)
+        out.to_csv(fname, index=False)
+        ctx.setdefault("artifacts", []).append(fname)
 
-    return out, ctx
+        # Store in context
+        ctx.setdefault("stats", {})[col] = out
+
+        # Prepare merged df (optional)
+        if replace_df:
+            # rename metrics columns with suffix to avoid collisions when merging multiple cols
+            rename_map = {m: f"{col}_{m}" for m in metrics}
+            out_ren = out.rename(columns=rename_map)
+            merged = out_ren if merged is None else merged.merge(out_ren, on=technology_col, how="outer")
+
+    # Replace df only if requested and at least one col processed
+    if replace_df and merged is not None:
+        return merged, ctx
+
+    # Otherwise passthrough original df
+    return df, ctx
+
 
 
 
