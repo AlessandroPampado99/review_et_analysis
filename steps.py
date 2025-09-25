@@ -15,6 +15,11 @@ import matplotlib.pyplot as plt
 import os
 import numpy as np
 import re
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+import random
+import logging
+logger = logging.getLogger("pipeline")
 
 
 # --- utility ---
@@ -40,6 +45,38 @@ def step(name: str):
 
 def _ensure_parent_dir(path: str):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+    
+
+# ----------- Assign colors -----------------
+
+@step("assign_colors_by_technology")
+def assign_colors_by_technology(
+    df: pd.DataFrame,
+    ctx: dict,
+    technology_col: str = "Technology name",
+    cmap_name: str = "tab20",           # any Matplotlib colormap
+    seed: int = 42,                     # fixed seed for reproducibility
+    shuffle: bool = False,              # shuffle color assignment if True
+    **_,
+):
+    """Assign a distinct color to each technology and store it in ctx['color_map']."""
+    if technology_col not in df.columns:
+        raise KeyError(f"Column '{technology_col}' not found.")
+
+    techs = sorted(df[technology_col].dropna().unique().tolist())
+    if not techs:
+        return df, ctx
+
+    cmap = cm.get_cmap(cmap_name, len(techs))
+    colors = [mcolors.to_hex(cmap(i)) for i in range(cmap.N)]
+
+    random.seed(seed)
+    if shuffle:
+        random.shuffle(colors)
+
+    color_map = {tech: colors[i % len(colors)] for i, tech in enumerate(techs)}
+    ctx["color_map"] = color_map
+    return df, ctx
 
 
 # ---------- Basic steps ----------
@@ -191,40 +228,117 @@ def stats_by_technology(
 
 # ---------- Plot steps ----------
 
-@step("plot_capex_bar_by_technology")
-def plot_capex_bar_by_technology(
+@step("plot_bar_by_technology")
+def plot_bar_by_technology(
     df: pd.DataFrame,
     ctx: dict,
+    stats_source_col: str,                    # e.g. "CAPEX" or "OPEX"
     technology_col: str = "Technology name",
-    value_col: str = "mean",
-    top_n: Optional[int] = 20,
-    out_path: str = "./out/capex_bar.png",
+    value_col: str = "mean",                  # one of the computed metrics (must exist in stats table)
+    error_col: str = "std",                   # if missing in stats table, no error bars
+    count_col: str = "count",                 # if missing in stats table, no annotation
+    top_n: Optional[int] = None,              # default=None -> show ALL; set to int to limit
+    out_dir: Optional[str] = None,            # directory; filename is auto
+    title: Optional[str] = None,
+    cmap_name: str = "tab20",                 # used only if no ctx["color_map"]
+    tick_labelsize: int = 9,                  # smaller x tick labels
     **_,
 ):
     """
-    Plot a bar chart using the aggregated CAPEX statistics (e.g., mean).
+    General bar plot by technology for any stats_source_col computed by stats_by_technology.
+    One bar per technology: height = <value_col>, error = <error_col> (if present), annotation = <count_col> (if present).
+    Saves to <out_dir>/barplot_<stats_source_col>_<value_col>.png (auto if out_dir is None).
     """
-    # usa tabella stats se disponibile
-    stats_df = ctx.get("capex_stats", df)
-    if technology_col not in stats_df.columns or value_col not in stats_df.columns:
-        raise KeyError(f"Columns '{technology_col}' and/or '{value_col}' not found in capex_stats.")
+    logger.info(f"[plot_bar_by_technology] source='{stats_source_col}', value='{value_col}', top_n={top_n}")
 
-    series = stats_df.set_index(technology_col)[value_col].sort_values(ascending=False)
-    if top_n and top_n > 0:
-        series = series.head(top_n)
+    # Retrieve stats table from ctx and validate
+    stats_all = ctx.get("stats", {})
+    if stats_source_col not in stats_all:
+        raise KeyError(
+            f"No stats found in ctx for column '{stats_source_col}'. "
+            f"Run 'stats_by_technology' with columns including '{stats_source_col}' first."
+        )
+    sdf = stats_all[stats_source_col]
 
-    _ensure_parent_dir(out_path)
-    plt.figure()
-    series.plot(kind="bar")
-    plt.xlabel(technology_col)
-    plt.ylabel(value_col)
-    plt.title(f"{value_col} by {technology_col}")
+    if technology_col not in sdf.columns:
+        raise KeyError(f"Column '{technology_col}' not found in stats for '{stats_source_col}'.")
+    if value_col not in sdf.columns:
+        raise KeyError(f"Column '{value_col}' not found in stats for '{stats_source_col}'.")
+
+    # Sort and optionally trim
+    sdf_ord = sdf.sort_values(by=value_col, ascending=False).copy()
+    if isinstance(top_n, int) and top_n > 0:
+        sdf_ord = sdf_ord.head(top_n)
+
+    # Prepare color map: use ctx if available, otherwise create and store
+    color_map = ctx.get("color_map")
+    techs = sdf_ord[technology_col].tolist()
+
+    if not color_map:
+        logger.info("[plot_bar_by_technology] No color_map in ctx; generating a temporary palette.")
+        cmap = cm.get_cmap(cmap_name, len(techs))
+        color_map = {tech: mcolors.to_hex(cmap(i)) for i, tech in enumerate(techs)}
+        ctx["color_map"] = ctx.get("color_map", {})
+        ctx["color_map"].update(color_map)
+
+    colors = [color_map.get(t, "#999999") for t in techs]
+
+    # Values and optional errors
+    y = sdf_ord[value_col].values
+    yerr = sdf_ord[error_col].values if error_col in sdf_ord.columns else None
+
+    # Decide output directory & filename
+    base_out_dir = ctx.get("base_out_dir", "./out")
+    out_dir = out_dir or base_out_dir
+    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
+    out_fp = os.path.join(out_dir, f"barplot_{_slugify(stats_source_col)}_{_slugify(value_col)}.png")
+
+    # --- Plot ---
+    plt.figure(figsize=(12, 6))
+    x = np.arange(len(techs))
+    bars = plt.bar(
+        x, y,
+        yerr=yerr if yerr is not None else None,
+        capsize=3 if yerr is not None else 0,
+        edgecolor="black",
+        linewidth=0.6
+    )
+    for bar, c in zip(bars, colors):
+        bar.set_color(c)
+
+    # Axis/labels styling
+    plt.xticks(x, techs, rotation=45, ha="right", fontsize=tick_labelsize)
+    plt.ylabel(value_col, fontweight="bold")
+    plt.xlabel(technology_col, fontweight="bold")
+    ttl = title or f"{stats_source_col} — {value_col} by {technology_col}"
+    plt.title(ttl, fontweight="bold")
     plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
+
+    # Annotate counts ABOVE bars (taking error bar into account if present)
+    if count_col in sdf_ord.columns:
+        counts = sdf_ord[count_col].values
+        # compute a small offset relative to data range
+        y_top_for_offset = y + (yerr if yerr is not None else 0)
+        data_span = (np.nanmax(y_top_for_offset) - np.nanmin(y_top_for_offset)) if len(y_top_for_offset) else 1.0
+        offset = 0.02 * data_span if data_span > 0 else 0.02  # 2% of span
+
+        for xi, yi, cnt, err in zip(x, y, counts, (yerr if yerr is not None else np.zeros_like(y))):
+            if pd.notna(yi):
+                y_annot = yi + (err if pd.notna(err) else 0.0) + offset
+                try:
+                    txt = f"{int(cnt)}"
+                except Exception:
+                    txt = f"{cnt}"
+                plt.text(xi, y_annot, txt, ha="center", va="bottom", fontsize=9)
+
+    plt.savefig(out_fp, dpi=200)
     plt.close()
 
-    ctx.setdefault("artifacts", []).append(out_path)
+    logger.info(f"[plot_bar_by_technology] Saved plot to {out_fp}")
+    ctx.setdefault("artifacts", []).append(out_fp)
     return df, ctx
+
+
 
 
 @step("plot_capex_gaussian_by_technology")

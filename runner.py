@@ -15,6 +15,17 @@ import yaml
 
 from steps import STEP_REGISTRY  # registry and steps live together for simplicity
 
+import logging
+from datetime import datetime
+
+# --- Logger configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("pipeline")
+
 
 def ensure_parent_dir(path: str):
     """Ensure the parent directory of 'path' exists."""
@@ -138,13 +149,20 @@ def run_pipeline(config: dict):
     }
 
     # Execute pipeline
-    for item in config.get("pipeline", []):
+    for i, item in enumerate(config.get("pipeline", []), start=1):
         name = item.get("step")
         params = item.get("params", {}) or {}
         if name not in STEP_REGISTRY:
             raise ValueError(f"Unknown step: {name}")
         fn = STEP_REGISTRY[name]
-        df, ctx = fn(df, ctx, **params)
+    
+        logger.info(f"Step {i}/{len(config.get('pipeline', []))}: '{name}' started.")
+        try:
+            df, ctx = fn(df, ctx, **params)
+            logger.info(f"Step '{name}' completed.")
+        except Exception as e:
+            logger.error(f"Step '{name}' failed: {e}")
+            raise
 
     # Save final df if requested
     if out_cfg.get("save_csv", False):
@@ -169,5 +187,5 @@ if __name__ == "__main__":
     cfg_path = r"configs/config.yaml"
     df_final, context = run_with_config(cfg_path)
     print("Pipeline done.")
-    print("Artifacts:", context.get("artifacts", []))
-    print("Final output:", context.get("final_output"))
+    # print("Artifacts:", context.get("artifacts", []))
+    # print("Final output:", context.get("final_output"))

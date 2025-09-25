@@ -22,6 +22,13 @@ pipeline:
   - step: filter_rows
     params:
       query: "CAPEX > 0"
+      
+  - step: assign_colors_by_technology
+    params:
+      technology_col: "Technology name"
+      cmap_name: "tab20"
+      seed: 42
+      shuffle: false
 
   - step: stats_by_technology
     params:
@@ -30,19 +37,25 @@ pipeline:
       metrics: ["mean", "median", "min", "max", "count", "std"]
       output_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\stats"
 
-  # - step: plot_capex_bar_by_technology
-  #   params:
-  #     technology_col: "Technology name"
-  #     value_col: "mean"
-  #     top_n: 20
-  #     out_path: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\capex\\capex_mean_by_tech.png"
+  # bar plot for CAPEX
+  - step: plot_bar_by_technology
+    params:
+      stats_source_col: "CAPEX"
+      value_col: "mean"
+      error_col: "std"
+      count_col: "count"
+      # top_n: 20
+      out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\capex"
 
-  # - step: plot_capex_gaussian_by_technology
-  #   params:
-  #     technology_col: "Technology name"
-  #     tech_select: ["Hydrogen Gas Storage", "Alkaline  Electrolyzer"]
-  #     out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\capex\\capex_mean_by_tech.png"
-
+  # bar plot per OPEX
+  - step: plot_bar_by_technology
+    params:
+      stats_source_col: "efficiency"
+      value_col: "mean"
+      error_col: "std"
+      count_col: "count"
+      top_n: 30
+      out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\efficiency"
 
 output:
   save_csv: true
