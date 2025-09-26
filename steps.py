@@ -19,6 +19,8 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import random
 import logging
+import networkx as nx
+import plotly.graph_objects as go
 logger = logging.getLogger("pipeline")
 
 
@@ -27,6 +29,17 @@ def _slugify(text: str) -> str:
     text = re.sub(r"\s+", "_", text.strip())
     text = re.sub(r"[^\w\-\.]", "", text)
     return text
+
+def _split_tokens(s, seps=(";", ",", "|")):
+    """Split string s by any of the separators; return cleaned list (drop empty)."""
+    if pd.isna(s):
+        return []
+    if not isinstance(s, str):
+        s = str(s)
+    pattern = "|".join(map(re.escape, seps))
+    parts = re.split(pattern, s)
+    return [p.strip() for p in parts if p and p.strip()]
+
 
 
 # ---------- Registry ----------
@@ -474,4 +487,335 @@ def plot_gaussian_with_samples_by_technology(
         ctx.setdefault("artifacts", []).append(fname)
 
     return df, ctx
+
+
+# ----------------- Plots maps ---------------------
+
+@step("build_flow_graph")
+def build_flow_graph(
+    df: pd.DataFrame,
+    ctx: dict,
+    input_col: str = "Input",
+    technology_col: str = "Technology name",
+    output_col: str = "Output",
+    token_separators: list = (";", ",", "|"),
+    # --- how to get raw weights ---
+    weight_mode: str = "stats",                # "stats" | "column" | "uniform"
+    weight_stats_source_col: str = "CAPEX",    # if stats
+    weight_stats_metric: str = "mean",         # e.g. "mean" | "count" | "median"
+    weight_column: str = None,                 # if column
+    # --- post-processing/normalization of weights ---
+    weight_scale: float = 1.0,                 # e.g. 0.01 to divide by 100
+    weight_transform: str = "none",            # "none" | "log10" | "sqrt"
+    weight_clip_min: float = 0.0,              # clip after transform
+    weight_clip_max: float = float("inf"),
+    min_weight: float = 0.0,                   # prune tiny edges after transform
+    **_,
+):
+    """
+    Build a flow graph Input -> Technology -> Output with weights.
+    Saves nodes and edges in ctx["flow_graph"].
+    """
+    logger.info("[build_flow_graph] building edges and nodes")
+
+    # Validate columns
+    for col in [input_col, technology_col, output_col]:
+        if col not in df.columns:
+            raise KeyError(f"Column '{col}' not found in df.")
+
+    # Decide weight per TECHNOLOGY (for both edge families)
+    tech_weight = {}
+
+    if weight_mode == "stats":
+        stats_all = ctx.get("stats", {})
+        if weight_stats_source_col not in stats_all:
+            raise KeyError(
+                f"No stats found in ctx for '{weight_stats_source_col}'. "
+                f"Run 'stats_by_technology' first."
+            )
+        sdf = stats_all[weight_stats_source_col]
+        if technology_col not in sdf.columns or weight_stats_metric not in sdf.columns:
+            raise KeyError(f"Stats table for '{weight_stats_source_col}' lacks '{technology_col}' or '{weight_stats_metric}'.")
+        tech_weight = dict(zip(sdf[technology_col], sdf[weight_stats_metric]))
+        weight_name = f"{weight_stats_source_col}_{weight_stats_metric}"
+
+    elif weight_mode == "column":
+        if weight_column is None or weight_column not in df.columns:
+            raise KeyError("weight_mode='column' requires an existing 'weight_column' in df.")
+        # aggregate per technology (sum by default)
+        grp = df.groupby(technology_col, dropna=True)[weight_column].sum(min_count=1)
+        tech_weight = grp.to_dict()
+        weight_name = f"{weight_column}_sum"
+
+    elif weight_mode == "uniform":
+        techs = df[technology_col].dropna().unique().tolist()
+        tech_weight = {t: 1.0 for t in techs}
+        weight_name = "uniform"
+
+    else:
+        raise ValueError("weight_mode must be one of {'stats','column','uniform'}")
+        
+    def _postproc(w):
+        w2 = float(w) * float(weight_scale)
+        if weight_transform == "log10":
+            # avoid log(0)
+            w2 = np.log10(max(w2, 1e-9))
+        elif weight_transform == "sqrt":
+            w2 = np.sqrt(max(w2, 0.0))
+        # clip
+        w2 = min(max(w2, weight_clip_min), weight_clip_max)
+        return w2
+
+    if weight_mode in ("stats", "column", "uniform"):
+        # apply to all tech weights
+        tech_weight = {t: _postproc(v) for t, v in tech_weight.items() if pd.notna(v)}
+        weight_name = f"{weight_name}_scaled{'' if weight_scale==1 else f'x{weight_scale}'}_{weight_transform}"
+
+
+    # Build edges (Input->Tech and Tech->Output), expanding multi tokens
+    edges = []
+    for _, row in df[[input_col, technology_col, output_col]].iterrows():
+        tech = row[technology_col]
+        if pd.isna(tech):
+            continue
+        w = tech_weight.get(tech, np.nan)
+        if not pd.notna(w):
+            continue  # skip tech with no weight
+
+        inputs = _split_tokens(row[input_col], token_separators)
+        outputs = _split_tokens(row[output_col], token_separators)
+
+        for inp in inputs:
+            edges.append(("input", inp, "tech", tech, w))
+        for outp in outputs:
+            edges.append(("tech", tech, "output", outp, w))
+
+    if not edges:
+        raise ValueError("No edges built. Check your columns and separators.")
+
+    edges_df = pd.DataFrame(edges, columns=["src_type", "src", "dst_type", "dst", "weight"])
+
+    # Aggregate same edges (sum weights)
+    edges_df = (
+        edges_df.groupby(["src_type", "src", "dst_type", "dst"], as_index=False)["weight"]
+        .sum()
+    )
+
+    # Prune tiny weights
+    if min_weight > 0:
+        edges_df = edges_df[edges_df["weight"] >= min_weight].reset_index(drop=True)
+
+    # Nodes df
+    inputs = edges_df.loc[edges_df["src_type"] == "input", "src"].tolist()
+    outputs = edges_df.loc[edges_df["dst_type"] == "output", "dst"].tolist()
+    techs = edges_df.loc[edges_df["src_type"] == "tech", "src"].tolist() + edges_df.loc[edges_df["dst_type"] == "tech", "dst"].tolist()
+    techs = sorted(set(techs))
+
+    nodes = []
+    for name in sorted(set(inputs)):
+        nodes.append(("input", name))
+    for name in techs:
+        nodes.append(("tech", name))
+    for name in sorted(set(outputs)):
+        nodes.append(("output", name))
+
+    nodes_df = pd.DataFrame(nodes, columns=["type", "name"])
+
+    # Sankey index mapping
+    node_index = {name: i for i, name in enumerate(nodes_df["name"].tolist())}
+    
+
+    ctx["flow_graph"] = {
+        "nodes_df": nodes_df,
+        "edges_df": edges_df,
+        "node_index": node_index,
+        "weight_name": weight_name,
+    }
+
+    logger.info(f"[build_flow_graph] nodes={len(nodes_df)}, edges={len(edges_df)}, weight={weight_name}")
+    return df, ctx
+
+
+@step("plot_flow_networkx")
+def plot_flow_networkx(
+    df: pd.DataFrame,
+    ctx: dict,
+    out_dir: str = None,                        # default: base_out_dir
+    node_size: int = 300,
+    edge_width_min: float = 0.6,      # minimum visible width
+    edge_width_max: float = 6.0,      # maximum width
+    edge_width_scale: float = 0.002,            # multiply weight by this for width
+    input_x: float = 0.0, tech_x: float = 0.5, output_x: float = 1.0,
+    tick_labelsize: int = 9,
+    **_,
+):
+    """
+    Plot a static 3-part network (input | tech | output) with edge thickness ~ weight.
+    Technology nodes colored via ctx['color_map']; inputs/outputs neutral.
+    """
+    fg = ctx.get("flow_graph")
+    if not fg:
+        raise RuntimeError("flow_graph not found in ctx. Run 'build_flow_graph' first.")
+    nodes_df = fg["nodes_df"]
+    edges_df = fg["edges_df"]
+    weight_name = fg.get("weight_name", "weight")
+
+    base_out_dir = ctx.get("base_out_dir", "./out")
+    out_dir = out_dir or base_out_dir
+    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
+    out_fp = os.path.join(out_dir, f"network_{_slugify(weight_name)}.png")
+
+    # Build graph
+    G = nx.DiGraph()
+    for _, r in nodes_df.iterrows():
+        G.add_node(r["name"], kind=r["type"])
+
+    for _, r in edges_df.iterrows():
+        G.add_edge(r["src"], r["dst"], weight=float(r["weight"]))
+
+    # Positions: stack inputs left, techs center, outputs right
+    pos = {}
+    color_map = ctx.get("color_map", {})
+    # y positions: spread evenly for each column
+    def _stack_positions(names, x_val):
+        n = max(len(names), 1)
+        ys = np.linspace(0, 1, n)
+        for i, name in enumerate(names):
+            pos[name] = (x_val, ys[i])
+
+    inputs = nodes_df[nodes_df["type"] == "input"]["name"].tolist()
+    techs  = nodes_df[nodes_df["type"] == "tech"]["name"].tolist()
+    outputs= nodes_df[nodes_df["type"] == "output"]["name"].tolist()
+
+    _stack_positions(inputs, input_x)
+    _stack_positions(techs, tech_x)
+    _stack_positions(outputs, output_x)
+
+    # node colors
+    node_colors = []
+    for n in G.nodes():
+        kind = G.nodes[n]["kind"]
+        if kind == "tech":
+            node_colors.append(color_map.get(n, "#4C78A8"))
+        elif kind == "input":
+            node_colors.append("#BBBBBB")
+        else:  # output
+            node_colors.append("#DDDDDD")
+
+    plt.figure(figsize=(14, 8))
+    nx.draw_networkx_nodes(G, pos, node_size=node_size, node_color=node_colors, edgecolors="black", linewidths=0.5)
+    nx.draw_networkx_labels(G, pos, font_size=tick_labelsize)
+
+    # edges with width scaled by weight
+    raw_w = np.array([float(G[u][v]["weight"]) for u, v in G.edges()])
+    if raw_w.size:
+        w_min, w_max = float(np.nanmin(raw_w)), float(np.nanmax(raw_w))
+        if w_max > w_min:
+            widths = edge_width_min + (raw_w - w_min) * (edge_width_max - edge_width_min) / (w_max - w_min)
+        else:
+            widths = np.full_like(raw_w, (edge_width_min + edge_width_max) / 2.0)
+    else:
+        widths = []
+    
+    nx.draw_networkx_edges(G, pos, width=widths, arrows=True, arrowsize=10, alpha=0.7)
+
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(out_fp, dpi=200)
+    plt.close()
+
+    logger.info(f"[plot_flow_networkx] Saved {out_fp}")
+    ctx.setdefault("artifacts", []).append(out_fp)
+    return df, ctx
+
+
+@step("plot_flow_sankey")
+def plot_flow_sankey(
+    df: pd.DataFrame,
+    ctx: dict,
+    out_dir: str = None,                    # default: base_out_dir
+    tech_color_alpha: float = 0.9,          # alpha for tech node colors
+    save_png: bool = False,                 # requires orca/kaleido if True
+    **_,
+):
+    """
+    Plot an interactive Sankey diagram based on the built flow graph.
+    - Saves HTML (always), and optionally PNG.
+    - Technology nodes colored via ctx['color_map']; inputs/outputs neutral.
+    """
+    fg = ctx.get("flow_graph")
+    if not fg:
+        raise RuntimeError("flow_graph not found in ctx. Run 'build_flow_graph' first.")
+
+    nodes_df = fg["nodes_df"]
+    edges_df = fg["edges_df"]
+    node_index = fg["node_index"]
+    weight_name = fg.get("weight_name", "weight")
+
+    base_out_dir = ctx.get("base_out_dir", "./out")
+    out_dir = out_dir or base_out_dir
+    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
+    out_html = os.path.join(out_dir, f"sankey_{_slugify(weight_name)}.html")
+    out_png  = os.path.join(out_dir, f"sankey_{_slugify(weight_name)}.png")
+
+    labels = nodes_df["name"].tolist()
+    # node colors
+    color_map = ctx.get("color_map", {})
+    node_colors = []
+    for _, r in nodes_df.iterrows():
+        if r["type"] == "tech":
+            c = mcolors.to_rgba(color_map.get(r["name"], "#4C78A8"), alpha=tech_color_alpha)
+        elif r["type"] == "input":
+            c = mcolors.to_rgba("#BBBBBB", alpha=0.8)
+        else:
+            c = mcolors.to_rgba("#DDDDDD", alpha=0.8)
+        # plotly wants rgb/rgba strings
+        node_colors.append(f"rgba({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)},{c[3]:.2f})")
+
+    # edges
+    sources = []
+    targets = []
+    values  = []
+    for _, r in edges_df.iterrows():
+        s = node_index[r["src"]]
+        t = node_index[r["dst"]]
+        v = float(r["weight"])
+        sources.append(s)
+        targets.append(t)
+        values.append(v)
+
+    fig = go.Figure(data=[go.Sankey(
+        node=dict(
+            pad=12,
+            thickness=14,
+            line=dict(color="black", width=0.5),
+            label=labels,
+            color=node_colors
+        ),
+        link=dict(
+            source=sources,
+            target=targets,
+            value=values
+        )
+    )])
+
+    fig.update_layout(
+        title_text=f"Flows (weight = {weight_name})",
+        font=dict(size=12)
+    )
+
+    fig.write_html(out_html)
+    logger.info(f"[plot_flow_sankey] Saved HTML to {out_html}")
+    ctx.setdefault("artifacts", []).append(out_html)
+
+    if save_png:
+        try:
+            fig.write_image(out_png, scale=2)
+            logger.info(f"[plot_flow_sankey] Saved PNG to {out_png}")
+            ctx["artifacts"].append(out_png)
+        except Exception as e:
+            logger.warning(f"[plot_flow_sankey] PNG export failed (install kaleido): {e}")
+
+    return df, ctx
+
 

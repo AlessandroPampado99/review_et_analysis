@@ -62,7 +62,7 @@ pipeline:
     params:
         stats_source_col: "CAPEX"        # column for the Gaussian
         # data_source_col: "CAPEX"       # optional (default = stats_source_col)
-        tech_select: ["all"]             # or list: ["PEM  Electrolyzer", "Battery Storage"]
+        tech_select: ["PEM  Electrolyzer"]             # or list: ["PEM  Electrolyzer", "Battery Storage"]
         use_original_df: true         # true if you want from the original df
         out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\capex"
         x_sigma_span: 4.0
@@ -71,6 +71,33 @@ pipeline:
         show_rug: true                   # points on the x-axis
         rug_size: 30
         rug_alpha: 0.7
+
+  # 3) costruisci il grafo: pesi dalla media CAPEX (oppure metti count)
+  - step: build_flow_graph
+    params:
+      input_col: "Input"
+      technology_col: "Technology name"
+      output_col: "Output"
+      token_separators: [";", ",", "|"]
+      weight_mode: "stats"             # "stats" | "column" | "uniform"
+      weight_stats_source_col: "CAPEX" # da ctx["stats"]["CAPEX"]
+      weight_stats_metric: "mean"      # oppure "count" se vuoi il numero di punti
+      weight_scale: 0.01          # <= divide per 100
+      weight_transform: "none"    # opzionale: "sqrt" o "log10"
+      min_weight: 0.0
+
+  # 4A) rete statica (PNG)
+  - step: plot_flow_networkx
+    params:
+      edge_width_min: 0.6
+      edge_width_max: 6.0
+      # out_dir: "C:\\...\\output\\graphs"
+
+  # 4B) sankey interattivo (HTML + opz. PNG)
+  - step: plot_flow_sankey
+    params:
+      save_png: false
+      # out_dir: "C:\\...\\output\\graphs"
 
 
 output:
