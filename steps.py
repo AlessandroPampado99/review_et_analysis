@@ -339,29 +339,38 @@ def plot_bar_by_technology(
     return df, ctx
 
 
-@step("plot_gaussian_by_technology")
-def plot_gaussian_by_technology(
+@step("plot_gaussian_with_samples_by_technology")
+def plot_gaussian_with_samples_by_technology(
     df: pd.DataFrame,
     ctx: dict,
-    stats_source_col: str,                   # e.g. "CAPEX" or "OPEX"
+    stats_source_col: str,                     # e.g., "CAPEX" or "OPEX" (used to pick mean/std from ctx['stats'])
+    data_source_col: str = None,               # column in df holding raw samples; default: = stats_source_col
     technology_col: str = "Technology name",
     mean_col: str = "mean",
     std_col: str = "std",
-    tech_select: Optional[List[str]] = None, # ["all"] or explicit list
-    out_dir: Optional[str] = None,           # default: <base_out_dir>/gaussians_<source>
-    x_sigma_span: float = 4.0,
-    tick_labelsize: int = 9,
-    line_width: float = 2.0,
-    cmap_name: str = "tab20",                # used only if no ctx["color_map"]
+    tech_select: Optional[List[str]] = None,   # ["all"] or list of technologies
+    out_dir: Optional[str] = None,             # default: <base_out_dir>/gaussians_<source>_with_samples
+    x_sigma_span: float = 4.0,                 # x-range around mean
+    show_hist: bool = False,                   # overlay density histogram
+    bins: int = 30,                            # bins for histogram
+    show_rug: bool = True,                     # show raw sample points along the x-axis baseline
+    rug_size: float = 30.0,                    # marker size for rug points
+    rug_alpha: float = 0.7,                    # alpha for rug points
+    line_width: float = 2.0,                   # gaussian line width
+    tick_labelsize: int = 9,                   # ticks font size
+    cmap_name: str = "tab20",                  # only used if no ctx["color_map"]
+    use_original_df: bool = False,             # take samples from ctx["_original_df"] instead of current df
     **_,
 ):
     """
-    Plot Gaussian curves using mean/std from ctx['stats'][stats_source_col].
-    One PNG per technology. Colors taken from ctx['color_map'] if available.
+    Plot Normal(mu, sigma) curves (from aggregated stats) and overlay empirical samples.
+    - Reads mean/std from ctx['stats'][stats_source_col].
+    - Reads raw samples from `df[data_source_col]` (or ctx['_original_df'] if use_original_df=True).
+    - One PNG per technology.
     """
-    logger.info(f"[plot_gaussian_by_technology] source='{stats_source_col}', tech_select={tech_select}")
+    logger.info(f"[plot_gaussian_with_samples_by_technology] source='{stats_source_col}', tech_select={tech_select}, hist={show_hist}, rug={show_rug}")
 
-    # get stats table for the requested source
+    # pick stats table
     stats_all = ctx.get("stats", {})
     if stats_source_col not in stats_all:
         raise KeyError(
@@ -370,52 +379,88 @@ def plot_gaussian_by_technology(
         )
     sdf = stats_all[stats_source_col]
 
-    # validate required columns
+    # validate required columns in stats
     for col in [technology_col, mean_col, std_col]:
         if col not in sdf.columns:
             raise KeyError(f"Column '{col}' required in stats for '{stats_source_col}'.")
 
-    # tech selection
+    # where to get raw samples from
+    base_df = ctx.get("_original_df") if use_original_df else df
+    data_source_col = data_source_col or stats_source_col
+    if technology_col not in base_df.columns or data_source_col not in base_df.columns:
+        raise KeyError(
+            f"Columns '{technology_col}' and/or '{data_source_col}' not found in the selected data frame "
+            f"({'_original_df' if use_original_df else 'df'})."
+        )
+
+    # select technologies
     if tech_select is None or (len(tech_select) == 1 and str(tech_select[0]).lower() == "all"):
         tech_list = sorted(sdf[technology_col].dropna().unique().tolist())
     else:
         tech_list = tech_select
 
-    # decide output directory
+    # output dir
     base_out_dir = ctx.get("base_out_dir", "./out")
-    out_dir = out_dir or os.path.join(base_out_dir, f"gaussians_{_slugify(stats_source_col)}")
+    out_dir = out_dir or os.path.join(base_out_dir, f"gaussians_{_slugify(stats_source_col)}_with_samples")
     _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
 
-    # color map: reuse global if present, else create a consistent local palette
+    # colors
     color_map = ctx.get("color_map")
     if not color_map:
-        logger.info("[plot_gaussian_by_technology] No color_map in ctx; creating a temporary palette.")
+        logger.info("[plot_gaussian_with_samples_by_technology] No color_map in ctx; creating a temporary palette.")
         cmap = cm.get_cmap(cmap_name, len(tech_list))
         color_map = {t: mcolors.to_hex(cmap(i)) for i, t in enumerate(tech_list)}
         ctx["color_map"] = ctx.get("color_map", {})
         ctx["color_map"].update(color_map)
 
-    # generate one plot per technology
     for tech in tech_list:
         row = sdf[sdf[technology_col] == tech]
         if row.empty:
-            logger.warning(f"[plot_gaussian_by_technology] Technology '{tech}' not found in stats table. Skipping.")
+            logger.warning(f"[plot_gaussian_with_samples_by_technology] Technology '{tech}' not found in stats. Skipping.")
             continue
 
         mu = float(row[mean_col].iloc[0])
         sigma = float(row[std_col].iloc[0])
         if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0:
-            logger.warning(f"[plot_gaussian_by_technology] Non-positive or invalid sigma for '{tech}'. Skipping.")
+            logger.warning(f"[plot_gaussian_with_samples_by_technology] Invalid sigma for '{tech}' (mu={mu}, sigma={sigma}). Skipping.")
             continue
 
-        xs = np.linspace(mu - x_sigma_span * sigma, mu + x_sigma_span * sigma, 400)
+        # raw samples for this technology
+        sub = base_df[base_df[technology_col] == tech]
+        xsamp = pd.to_numeric(sub[data_source_col], errors="coerce").dropna().values
+        # define x-range covering both gaussian span and sample min/max (if any)
+        if xsamp.size:
+            xmin_data, xmax_data = np.nanmin(xsamp), np.nanmax(xsamp)
+        else:
+            xmin_data, xmax_data = np.nan, np.nan
+
+        xg_min = mu - x_sigma_span * sigma
+        xg_max = mu + x_sigma_span * sigma
+        x_min = np.nanmin([xg_min, xmin_data]) if np.isfinite(xmin_data) else xg_min
+        x_max = np.nanmax([xg_max, xmax_data]) if np.isfinite(xmax_data) else xg_max
+
+        xs = np.linspace(x_min, x_max, 400)
         pdf = (1.0 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((xs - mu) / sigma) ** 2)
 
         color = color_map.get(tech, "#333333")
-        fname = os.path.join(out_dir, f"gaussian_{_slugify(stats_source_col)}_{_slugify(tech)}.png")
+        fname = os.path.join(out_dir, f"gaussian_samples_{_slugify(stats_source_col)}_{_slugify(tech)}.png")
 
         plt.figure(figsize=(10, 5))
+
+        # optional histogram (density)
+        if show_hist and xsamp.size:
+            plt.hist(xsamp, bins=bins, density=True, alpha=0.25)
+
+        # gaussian curve
         plt.plot(xs, pdf, linewidth=line_width, color=color)
+
+        # rug plot for samples (points along baseline)
+        if show_rug and xsamp.size:
+            # place points near y=0; scale marker size relative to figure
+            y_rug = np.zeros_like(xsamp)
+            plt.scatter(xsamp, y_rug, s=rug_size, alpha=rug_alpha, edgecolors="none")
+
+        # axes/labels
         plt.xlabel(stats_source_col, fontweight="bold")
         plt.ylabel("Density", fontweight="bold")
         plt.title(f"{tech} — Normal(μ={mu:.2f}, σ={sigma:.2f})", fontweight="bold")
@@ -425,7 +470,7 @@ def plot_gaussian_by_technology(
         plt.savefig(fname, dpi=200)
         plt.close()
 
-        logger.info(f"[plot_gaussian_by_technology] Saved {fname}")
+        logger.info(f"[plot_gaussian_with_samples_by_technology] Saved {fname}")
         ctx.setdefault("artifacts", []).append(fname)
 
     return df, ctx

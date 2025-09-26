@@ -58,12 +58,19 @@ pipeline:
       out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\efficiency"
 
 # dopo assign_colors_by_technology e stats_by_technology
-  - step: plot_gaussian_by_technology
+  - step: plot_gaussian_with_samples_by_technology
     params:
-      stats_source_col: "CAPEX"            # oppure "OPEX", ecc.
-      tech_select: ["all"]                 # oppure: ["PEM  Electrolyzer", "Battery Storage"]
-      # out_dir: "C:\\path\\to\\out\\gaussians_CAPEX"   # opzionale; default auto
-      x_sigma_span: 4.0
+        stats_source_col: "CAPEX"        # column for the Gaussian
+        # data_source_col: "CAPEX"       # optional (default = stats_source_col)
+        tech_select: ["all"]             # or list: ["PEM  Electrolyzer", "Battery Storage"]
+        use_original_df: true         # true if you want from the original df
+        out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\capex"
+        x_sigma_span: 4.0
+        show_hist: true                  # histogram in density
+        bins: 30
+        show_rug: true                   # points on the x-axis
+        rug_size: 30
+        rug_alpha: 0.7
 
 
 output:
