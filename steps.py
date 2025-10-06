@@ -21,6 +21,7 @@ import random
 import logging
 import networkx as nx
 import plotly.graph_objects as go
+from pyvis.network import Network
 logger = logging.getLogger("pipeline")
 
 
@@ -39,8 +40,6 @@ def _split_tokens(s, seps=(";", ",", "|")):
     pattern = "|".join(map(re.escape, seps))
     parts = re.split(pattern, s)
     return [p.strip() for p in parts if p and p.strip()]
-
-
 
 # ---------- Registry ----------
 
@@ -89,6 +88,22 @@ def assign_colors_by_technology(
 
     color_map = {tech: colors[i % len(colors)] for i, tech in enumerate(techs)}
     ctx["color_map"] = color_map
+    return df, ctx
+
+
+@step("assign_sector_colors")
+def assign_sector_colors(
+    df, ctx,
+    sector_col: str = "Sector",
+    palette: str = "tab20",
+    seed: int = 42,
+    **_,
+):
+    """Assign a distinct color to each Sector and store in ctx['sector_colors']."""
+    sectors = sorted(s for s in df[sector_col].dropna().unique().tolist())
+    cmap = cm.get_cmap(palette, max(1, len(sectors)))
+    sector_colors = {s: mcolors.to_hex(cmap(i)) for i, s in enumerate(sectors)}
+    ctx["sector_colors"] = sector_colors
     return df, ctx
 
 
@@ -636,186 +651,507 @@ def build_flow_graph(
     return df, ctx
 
 
-@step("plot_flow_networkx")
-def plot_flow_networkx(
+@step("plot_carrier_networkx")
+def plot_carrier_networkx(
     df: pd.DataFrame,
     ctx: dict,
-    out_dir: str = None,                        # default: base_out_dir
-    node_size: int = 300,
-    edge_width_min: float = 0.6,      # minimum visible width
-    edge_width_max: float = 6.0,      # maximum width
-    edge_width_scale: float = 0.002,            # multiply weight by this for width
-    input_x: float = 0.0, tech_x: float = 0.5, output_x: float = 1.0,
+    # I/O
+    out_dir: str = None,
+    # estetica archi
+    edge_width_min: float = 0.6,
+    edge_width_max: float = 6.0,
+    alpha: float = 0.7,
+    connectionstyle: str = "arc3,rad=0.06",
+    # estetica nodi/testi
     tick_labelsize: int = 9,
+    node_size: int = 420,
+    # layout
+    layout_mode: str = "sector_columns",   # "three_column" | "two_column" | "sector_columns"
+    num_sector_cols: int = 6,              # quante colonne orizzontali dedicate ai settori
+    x_pad: float = 0.10,                   # padding laterale (0..0.5)
+    in_out_offset: float = 0.035,          # offset orizzontale delle sotto-colonne (in/mixed/out)
+    sort_within_sector: str = "degree",    # "degree" | "alpha"
+    jitter_y: float = 0.006,
+    hide_self_loops: bool = False,
+    sector_col: str = "Sector",
+    input_col: str = "Input",
+    output_col: str = "Output",
+    technology_col: str = "Technology name",
+    token_separators: list = (";", ",", "|"),
     **_,
 ):
     """
-    Plot a static 3-part network (input | tech | output) with edge thickness ~ weight.
-    Technology nodes colored via ctx['color_map']; inputs/outputs neutral.
+    Carrier graph:
+    - 'sector_columns': crea colonne per settore (5/6 ecc.). Dentro ogni colonna:
+        input (x - offset), mixed (x), output (x + offset)
+      Colore nodo = colore del settore (da ctx['sector_colors']).
+    - altre modalità come prima ('three_column', 'two_column').
     """
-    fg = ctx.get("flow_graph")
-    if not fg:
-        raise RuntimeError("flow_graph not found in ctx. Run 'build_flow_graph' first.")
-    nodes_df = fg["nodes_df"]
-    edges_df = fg["edges_df"]
-    weight_name = fg.get("weight_name", "weight")
+    cg = ctx.get("carrier_graph")
+    if not cg:
+        raise RuntimeError("carrier_graph not found. Run 'build_carrier_graph' first.")
+    ed = cg["edges_df"].copy()
+    weight_name = cg.get("weight_name", "weight")
 
-    base_out_dir = ctx.get("base_out_dir", "./out")
-    out_dir = out_dir or base_out_dir
-    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
-    out_fp = os.path.join(out_dir, f"network_{_slugify(weight_name)}.png")
+    if hide_self_loops:
+        ed = ed[ed["in_car"] != ed["out_car"]].reset_index(drop=True)
 
-    # Build graph
-    G = nx.DiGraph()
-    for _, r in nodes_df.iterrows():
-        G.add_node(r["name"], kind=r["type"])
+    # 1) pesi per normalizzare larghezze
+    raw_w = ed["weight"].to_numpy(dtype=float)
+    if raw_w.size:
+        wmin, wmax = float(np.nanmin(raw_w)), float(np.nanmax(raw_w))
+    else:
+        wmin, wmax = 0.0, 1.0
 
-    for _, r in edges_df.iterrows():
-        G.add_edge(r["src"], r["dst"], weight=float(r["weight"]))
+    # 2) set di carrier e categorie
+    in_set  = set(ed["in_car"].unique())
+    out_set = set(ed["out_car"].unique())
+    carriers = sorted(in_set | out_set)
+    pure_inputs  = set(in_set - out_set)
+    pure_outputs = set(out_set - in_set)
+    mixed        = set(in_set & out_set)
 
-    # Positions: stack inputs left, techs center, outputs right
+    # 3) stima settore per ogni carrier: prendi il settore più frequente
+    #    tra le tecnologie che lo usano (come input o output)
+    def _split_tokens(s):
+        if pd.isna(s): return []
+        if not isinstance(s, str): s = str(s)
+        patt = "|".join(map(re.escape, token_separators))
+        return [t.strip() for t in re.split(patt, s) if t and t.strip()]
+
+    usage = {}  # carrier -> counter(sector)
+    from collections import Counter
+    for _, r in df[[sector_col, input_col, output_col]].iterrows():
+        sec = r.get(sector_col)
+        if pd.isna(sec): continue
+        sec = str(sec)
+        for c in _split_tokens(r.get(input_col)):
+            usage.setdefault(c, Counter()).update([sec])
+        for c in _split_tokens(r.get(output_col)):
+            usage.setdefault(c, Counter()).update([sec])
+
+    carrier_sector = {}
+    for c in carriers:
+        if c in usage and len(usage[c]) > 0:
+            carrier_sector[c] = usage[c].most_common(1)[0][0]
+        else:
+            carrier_sector[c] = "Unknown"
+
+    # 4) colori per settore (da ctx, o generane uno)
+    sector_colors = ctx.get("sector_colors")
+    if not sector_colors:
+        # fallback semplice
+        secs = sorted(set(carrier_sector.values()))
+        cmap = cm.get_cmap("tab20", len(secs))
+        sector_colors = {s: mcolors.to_hex(cmap(i)) for i, s in enumerate(secs)}
+        ctx["sector_colors"] = sector_colors
+
+    # 5) degree pesato per ordinamento dentro le colonne
+    w_in  = ed.groupby("out_car")["weight"].sum(min_count=1).rename("in_w")
+    w_out = ed.groupby("in_car")["weight"].sum(min_count=1).rename("out_w")
+    deg_df = pd.DataFrame({"carrier": carriers}).merge(w_in, left_on="carrier", right_index=True, how="left") \
+                                               .merge(w_out, left_on="carrier", right_index=True, how="left")
+    deg_df.fillna(0.0, inplace=True)
+    deg_df["deg_w"] = deg_df["in_w"] + deg_df["out_w"]
+    def _deg(c): return float(deg_df.loc[deg_df["carrier"]==c, "deg_w"].values[0])
+
+    # 6) posizioni
     pos = {}
-    color_map = ctx.get("color_map", {})
-    # y positions: spread evenly for each column
-    def _stack_positions(names, x_val):
-        n = max(len(names), 1)
-        ys = np.linspace(0, 1, n)
-        for i, name in enumerate(names):
-            pos[name] = (x_val, ys[i])
+    rng = np.random.default_rng(42)
 
-    inputs = nodes_df[nodes_df["type"] == "input"]["name"].tolist()
-    techs  = nodes_df[nodes_df["type"] == "tech"]["name"].tolist()
-    outputs= nodes_df[nodes_df["type"] == "output"]["name"].tolist()
+    if layout_mode == "sector_columns":
+        # mappa settore -> centro colonna su linspace
+        sectors_sorted = sorted(set(carrier_sector.values()),
+                                key=lambda s: -sum(_deg(c) for c in carriers if carrier_sector[c]==s))
+        ncols = max(1, min(num_sector_cols, len(sectors_sorted)))
+        xs_grid = np.linspace(x_pad, 1.0 - x_pad, ncols)
 
-    _stack_positions(inputs, input_x)
-    _stack_positions(techs, tech_x)
-    _stack_positions(outputs, output_x)
+        sec2x = {}
+        for idx, s in enumerate(sectors_sorted):
+            sec2x[s] = xs_grid[idx % ncols]
 
-    # node colors
-    node_colors = []
-    for n in G.nodes():
-        kind = G.nodes[n]["kind"]
-        if kind == "tech":
-            node_colors.append(color_map.get(n, "#4C78A8"))
-        elif kind == "input":
-            node_colors.append("#BBBBBB")
-        else:  # output
-            node_colors.append("#DDDDDD")
+        def _stack(names, x_center, offset):
+            names = sorted(names, key=lambda c: -_deg(c)) if sort_within_sector=="degree" else sorted(names)
+            n = max(1, len(names))
+            ys = np.linspace(0.02, 0.98, n)
+            if jitter_y and n > 1:
+                ys = ys + rng.normal(0.0, jitter_y, size=n)
+                ys = np.clip(ys, 0.01, 0.99)
+            for i, name in enumerate(names):
+                pos[name] = (float(x_center + offset), float(ys[i]))
 
-    plt.figure(figsize=(14, 8))
-    nx.draw_networkx_nodes(G, pos, node_size=node_size, node_color=node_colors, edgecolors="black", linewidths=0.5)
+        # per ciascun settore, distribuisci input/mixed/output con piccoli offset
+        for s in sectors_sorted:
+            x0 = sec2x[s]
+            in_names   = [c for c in carriers if carrier_sector[c]==s and c in pure_inputs]
+            mix_names  = [c for c in carriers if carrier_sector[c]==s and c in mixed]
+            out_names  = [c for c in carriers if carrier_sector[c]==s and c in pure_outputs]
+            _stack(in_names,  x0, -in_out_offset)
+            _stack(mix_names, x0, 0.0)
+            _stack(out_names, x0, +in_out_offset)
+
+    else:
+        # fallback: modalità precedenti
+        def _order(names): 
+            return sorted(names, key=lambda c: -_deg(c)) if sort_within_sector=="degree" else sorted(names)
+        if layout_mode == "three_column":
+            cols = [ (sorted(pure_inputs, key=lambda c:-_deg(c)), 0.0),
+                     (sorted(mixed, key=lambda c:-_deg(c)), 0.5),
+                     (sorted(pure_outputs, key=lambda c:-_deg(c)), 1.0) ]
+        else:
+            cols = [ (sorted(in_set, key=lambda c:-_deg(c)), 0.0),
+                     (sorted(out_set, key=lambda c:-_deg(c)), 1.0) ]
+        for names, x in cols:
+            n = max(1, len(names))
+            ys = np.linspace(0.02, 0.98, n)
+            if jitter_y and n > 1:
+                ys = ys + rng.normal(0.0, jitter_y, size=n)
+                ys = np.clip(ys, 0.01, 0.99)
+            for i, name in enumerate(names):
+                pos[name] = (x, float(ys[i]))
+
+    # 7) grafo + larghezze
+    G = nx.DiGraph()
+    G.add_nodes_from(carriers)
+    for _, r in ed.iterrows():
+        G.add_edge(r["in_car"], r["out_car"], weight=float(r["weight"]))
+
+    if wmax > wmin:
+        widths = edge_width_min + (raw_w - wmin) * (edge_width_max - edge_width_min) / (wmax - wmin)
+    else:
+        widths = np.full_like(raw_w, (edge_width_min + edge_width_max)/2.0)
+
+    # 8) disegno
+    base_out = ctx.get("base_out_dir", "./out")
+    out_dir = out_dir or base_out
+    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
+    out_fp = os.path.join(out_dir, f"carrier_network_{_slugify(weight_name)}_{layout_mode}.png")
+
+    plt.figure(figsize=(18, 10))
+    # colori per settore
+    node_colors = [sector_colors.get(carrier_sector[c], "#CCCCCC") for c in carriers]
+    nx.draw_networkx_nodes(G, pos, nodelist=carriers, node_color=node_colors,
+                           node_size=node_size, edgecolors="black", linewidths=0.5)
     nx.draw_networkx_labels(G, pos, font_size=tick_labelsize)
 
-    # edges with width scaled by weight
-    raw_w = np.array([float(G[u][v]["weight"]) for u, v in G.edges()])
-    if raw_w.size:
-        w_min, w_max = float(np.nanmin(raw_w)), float(np.nanmax(raw_w))
-        if w_max > w_min:
-            widths = edge_width_min + (raw_w - w_min) * (edge_width_max - edge_width_min) / (w_max - w_min)
-        else:
-            widths = np.full_like(raw_w, (edge_width_min + edge_width_max) / 2.0)
-    else:
-        widths = []
-    
-    nx.draw_networkx_edges(G, pos, width=widths, arrows=True, arrowsize=10, alpha=0.7)
+    # archi (curvi, trasparenti)
+    for (u, v), w in zip(G.edges(), widths):
+        nx.draw_networkx_edges(G, pos, edgelist=[(u, v)],
+                               width=float(w), alpha=alpha, arrows=True, arrowsize=10,
+                               connectionstyle=connectionstyle)
 
     plt.axis("off")
     plt.tight_layout()
     plt.savefig(out_fp, dpi=200)
     plt.close()
-
-    logger.info(f"[plot_flow_networkx] Saved {out_fp}")
+    logger.info(f"[plot_carrier_networkx] Saved {out_fp}")
     ctx.setdefault("artifacts", []).append(out_fp)
     return df, ctx
+
 
 
 @step("plot_flow_sankey")
 def plot_flow_sankey(
     df: pd.DataFrame,
     ctx: dict,
-    out_dir: str = None,                    # default: base_out_dir
-    tech_color_alpha: float = 0.9,          # alpha for tech node colors
-    save_png: bool = False,                 # requires orca/kaleido if True
+    out_dir: str = None,
+    min_link_value: float = 0.0,        # drop small links
+    group_others: bool = True,          # group small links into "Other"
+    others_label: str = "Other",
+    top_links_per_source: int = None,   # keep only top-K per source node (after threshold)
+    tech_color_alpha: float = 0.9,
+    sort_nodes: bool = True,            # sort nodes alphabetically within each column
     **_,
 ):
     """
-    Plot an interactive Sankey diagram based on the built flow graph.
-    - Saves HTML (always), and optionally PNG.
-    - Technology nodes colored via ctx['color_map']; inputs/outputs neutral.
+    Cleaner Sankey diagram (HTML) using flow_graph from build_flow_graph.
+    Applies thresholding and optional 'Other' grouping.
     """
     fg = ctx.get("flow_graph")
     if not fg:
         raise RuntimeError("flow_graph not found in ctx. Run 'build_flow_graph' first.")
 
-    nodes_df = fg["nodes_df"]
-    edges_df = fg["edges_df"]
-    node_index = fg["node_index"]
+    nodes_df = fg["nodes_df"].copy()
+    edges_df = fg["edges_df"].copy()
     weight_name = fg.get("weight_name", "weight")
 
-    base_out_dir = ctx.get("base_out_dir", "./out")
-    out_dir = out_dir or base_out_dir
-    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
-    out_html = os.path.join(out_dir, f"sankey_{_slugify(weight_name)}.html")
-    out_png  = os.path.join(out_dir, f"sankey_{_slugify(weight_name)}.png")
+    # split by type and sort
+    if sort_nodes:
+        inputs = sorted(nodes_df[nodes_df["type"]=="input"]["name"].tolist())
+        techs  = sorted(nodes_df[nodes_df["type"]=="tech"]["name"].tolist())
+        outputs= sorted(nodes_df[nodes_df["type"]=="output"]["name"].tolist())
+    else:
+        inputs = nodes_df[nodes_df["type"]=="input"]["name"].tolist()
+        techs  = nodes_df[nodes_df["type"]=="tech"]["name"].tolist()
+        outputs= nodes_df[nodes_df["type"]=="output"]["name"].tolist()
 
-    labels = nodes_df["name"].tolist()
-    # node colors
+    ordered = inputs + techs + outputs
+    node_index = {name: i for i, name in enumerate(ordered)}
+
+    # threshold links
+    ed = edges_df.copy()
+    ed = ed[ed["weight"] >= float(min_link_value)]
+
+    # top-K per source (optional)
+    if top_links_per_source and top_links_per_source > 0:
+        ed = (
+            ed.sort_values(["src", "weight"], ascending=[True, False])
+              .groupby("src", as_index=False)
+              .head(top_links_per_source)
+        )
+
+    # group small links into "Other"
+    if group_others:
+        # detect which targets are missing after filtering and redirect them to "Other"
+        # simpler: aggregate remaining small mass by src_type to one sink per column end
+        # We'll only group on the "tech->output" side for clarity
+        # (but you could extend to inputs similarly)
+        pass  # keep simple; thresholding + top-K already cleans a lot
+
+    # Labels + colors: techs keep their color_map
+    labels = ordered
     color_map = ctx.get("color_map", {})
     node_colors = []
-    for _, r in nodes_df.iterrows():
-        if r["type"] == "tech":
-            c = mcolors.to_rgba(color_map.get(r["name"], "#4C78A8"), alpha=tech_color_alpha)
-        elif r["type"] == "input":
-            c = mcolors.to_rgba("#BBBBBB", alpha=0.8)
+    for name in ordered:
+        if name in techs:
+            rgba = mcolors.to_rgba(color_map.get(name, "#4C78A8"), alpha=tech_color_alpha)
+        elif name in inputs:
+            rgba = mcolors.to_rgba("#BBBBBB", alpha=0.8)
         else:
-            c = mcolors.to_rgba("#DDDDDD", alpha=0.8)
-        # plotly wants rgb/rgba strings
-        node_colors.append(f"rgba({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)},{c[3]:.2f})")
+            rgba = mcolors.to_rgba("#DDDDDD", alpha=0.8)
+        node_colors.append(f"rgba({int(rgba[0]*255)},{int(rgba[1]*255)},{int(rgba[2]*255)},{rgba[3]:.2f})")
 
-    # edges
-    sources = []
-    targets = []
-    values  = []
-    for _, r in edges_df.iterrows():
-        s = node_index[r["src"]]
-        t = node_index[r["dst"]]
-        v = float(r["weight"])
-        sources.append(s)
-        targets.append(t)
-        values.append(v)
+    # build source/target/value arrays
+    sources, targets, values = [], [], []
+    for _, r in ed.iterrows():
+        if r["src"] not in node_index or r["dst"] not in node_index:
+            continue
+        sources.append(node_index[r["src"]])
+        targets.append(node_index[r["dst"]])
+        values.append(float(r["weight"]))
 
+    # figure
     fig = go.Figure(data=[go.Sankey(
         node=dict(
-            pad=12,
-            thickness=14,
-            line=dict(color="black", width=0.5),
-            label=labels,
-            color=node_colors
+            pad=12, thickness=14, line=dict(color="black", width=0.5),
+            label=labels, color=node_colors
         ),
-        link=dict(
-            source=sources,
-            target=targets,
-            value=values
-        )
+        link=dict(source=sources, target=targets, value=values)
     )])
+    fig.update_layout(title_text=f"Flows (weight = {weight_name})", font=dict(size=12))
 
-    fig.update_layout(
-        title_text=f"Flows (weight = {weight_name})",
-        font=dict(size=12)
-    )
-
+    base_out = ctx.get("base_out_dir", "./out")
+    out_dir = out_dir or base_out
+    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
+    out_html = os.path.join(out_dir, f"sankey_clean_{_slugify(weight_name)}.html")
     fig.write_html(out_html)
-    logger.info(f"[plot_flow_sankey] Saved HTML to {out_html}")
+    logger.info(f"[plot_flow_sankey_clean] Saved {out_html}")
     ctx.setdefault("artifacts", []).append(out_html)
-
-    if save_png:
-        try:
-            fig.write_image(out_png, scale=2)
-            logger.info(f"[plot_flow_sankey] Saved PNG to {out_png}")
-            ctx["artifacts"].append(out_png)
-        except Exception as e:
-            logger.warning(f"[plot_flow_sankey] PNG export failed (install kaleido): {e}")
-
     return df, ctx
 
+
+
+@step("build_carrier_graph")
+def build_carrier_graph(
+    df: pd.DataFrame,
+    ctx: dict,
+    input_col: str = "Input",
+    output_col: str = "Output",
+    token_separators: list = (";", ",", "|"),
+    # weights: "count" (default), or take from stats: ("stats", col="CAPEX", metric="mean")
+    weight_mode: str = "count",              # "count" | "stats"
+    weight_stats_source_col: str = "CAPEX",
+    weight_stats_metric: str = "count",      # often "count" or "mean"
+    technology_col: str = "Technology name", # used only for stats-mode
+    min_weight: float = 0.0,
+    directed: bool = True,
+    **_,
+):
+    """
+    Build a carrier-to-carrier graph: InputCarrier -> OutputCarrier.
+    Edge weight is count by default, or a stats value per technology accumulated across pairs.
+    """
+    if input_col not in df.columns or output_col not in df.columns:
+        raise KeyError("Input/Output columns not found.")
+
+    # explode multi-carrier cells
+    rows = []
+    for _, r in df[[input_col, output_col, technology_col]].iterrows():
+        ins = _split_tokens(r[input_col], token_separators)
+        outs = _split_tokens(r[output_col], token_separators)
+        tech = r.get(technology_col, None)
+        for i in ins:
+            for o in outs:
+                rows.append((i, o, tech))
+    if not rows:
+        raise ValueError("No carrier pairs built. Check separators/columns.")
+    pairs = pd.DataFrame(rows, columns=["in_car", "out_car", "tech"])
+
+    if weight_mode == "count":
+        ed = pairs.groupby(["in_car", "out_car"], as_index=False).size().rename(columns={"size": "weight"})
+        weight_name = "count"
+    elif weight_mode == "stats":
+        stats_all = ctx.get("stats", {})
+        if weight_stats_source_col not in stats_all:
+            raise KeyError(f"stats for '{weight_stats_source_col}' not in ctx. Run stats_by_technology first.")
+        sdf = stats_all[weight_stats_source_col][[technology_col, weight_stats_metric]].rename(columns={weight_stats_metric: "w"})
+        pairs = pairs.merge(sdf, left_on="tech", right_on=technology_col, how="left")
+        ed = pairs.groupby(["in_car", "out_car"], as_index=False)["w"].sum(min_count=1).rename(columns={"w": "weight"})
+        weight_name = f"{weight_stats_source_col}_{weight_stats_metric}"
+    else:
+        raise ValueError("weight_mode must be 'count' or 'stats'.")
+
+    if min_weight > 0:
+        ed = ed[ed["weight"] >= min_weight].reset_index(drop=True)
+
+    nodes = sorted(set(ed["in_car"]).union(set(ed["out_car"])))
+    nd = pd.DataFrame({"carrier": nodes})
+
+    ctx["carrier_graph"] = {
+        "edges_df": ed,
+        "nodes_df": nd,
+        "directed": directed,
+        "weight_name": weight_name,
+    }
+    logger.info(f"[build_carrier_graph] carriers={len(nodes)}, edges={len(ed)}, weight={weight_name}")
+    return df, ctx
+
+
+@step("build_tech_similarity_graph")
+def build_tech_similarity_graph(
+    df: pd.DataFrame,
+    ctx: dict,
+    technology_col: str = "Technology name",
+    sector_col: str = "Sector",
+    input_col: str = "Input",
+    output_col: str = "Output",
+    token_separators: list = (";", ",", "|"),
+    weight_mode: str = "count",   # "count" | "jaccard"
+    min_weight: float = 1.0,
+    **_,
+):
+    """
+    Build a technology co-occurrence graph:
+    - Two technologies are connected if they share at least one carrier (input or output).
+    - Edge weight = number of shared carriers (or Jaccard).
+    - Nodes colored by Sector (first non-null per technology).
+    """
+    if technology_col not in df.columns:
+        raise KeyError("Technology column not found.")
+
+    # tech -> set of carriers
+    tech_carriers = {}
+    tech_sector   = {}
+    for _, r in df[[technology_col, sector_col, input_col, output_col]].iterrows():
+        tech = r[technology_col]
+        if pd.isna(tech): continue
+        ins = _split_tokens(r.get(input_col, None), token_separators)
+        outs= _split_tokens(r.get(output_col, None), token_separators)
+        s = set(ins) | set(outs)
+        tech_carriers.setdefault(tech, set()).update(s)
+        # keep first seen sector if any
+        if tech not in tech_sector and pd.notna(r.get(sector_col, None)):
+            tech_sector[tech] = str(r[sector_col])
+
+    techs = sorted(tech_carriers.keys())
+    edges = []
+    for i in range(len(techs)):
+        for j in range(i+1, len(techs)):
+            a, b = techs[i], techs[j]
+            A, B = tech_carriers[a], tech_carriers[b]
+            inter = len(A & B)
+            if inter == 0: continue
+            if weight_mode == "count":
+                w = inter
+            elif weight_mode == "jaccard":
+                w = inter / max(1, len(A | B))
+            else:
+                raise ValueError("weight_mode must be 'count' or 'jaccard'")
+            if w >= min_weight:
+                edges.append((a, b, w))
+
+    nodes_df = pd.DataFrame({"tech": techs, "sector": [tech_sector.get(t, "Unknown") for t in techs]})
+    edges_df = pd.DataFrame(edges, columns=["src", "dst", "weight"])
+    ctx["tech_graph"] = {"nodes_df": nodes_df, "edges_df": edges_df}
+    logger.info(f"[build_tech_similarity_graph] techs={len(nodes_df)}, edges={len(edges_df)}")
+    return df, ctx
+
+
+@step("plot_interactive_force_pyvis")
+def plot_interactive_force_pyvis(
+    df: pd.DataFrame,
+    ctx: dict,
+    out_dir: str = None,
+    physics_solver: str = "forceAtlas2Based",   # "forceAtlas2Based" | "barnesHut" | "repulsion"
+    sector_palette: str = "tab20",              # Matplotlib colormap for sectors
+    node_size_base: int = 10,
+    edge_width_scale: float = 2.0,              # multiply weight for line width
+    **_,
+):
+    """
+    Interactive force-directed graph (PyVis) of technology similarity.
+    Nodes colored by Sector, edge width ∝ weight.
+    """
+    tg = ctx.get("tech_graph")
+    if not tg:
+        raise RuntimeError("tech_graph not found. Run 'build_tech_similarity_graph' first.")
+    nd, ed = tg["nodes_df"], tg["edges_df"]
+
+    # sector -> color
+    import matplotlib.cm as cm, matplotlib.colors as mcolors
+    sectors = sorted(nd["sector"].unique().tolist())
+    cmap = cm.get_cmap(sector_palette, len(sectors))
+    sector_colors = {s: mcolors.to_hex(cmap(i)) for i, s in enumerate(sectors)}
+
+    net = Network(height="800px", width="100%", directed=False, notebook=False, bgcolor="#111111", font_color="#EEEEEE")
+    net.toggle_physics(True)
+    options = {
+        "nodes": {
+            "shape": "dot",
+            "scaling": {"min": 5, "max": 40}
+        },
+        "edges": {
+            "color": {"color": "#aaaaaa"},
+            "smooth": {"type": "dynamic"}
+        },
+        "physics": {
+            "solver": physics_solver,
+            "stabilization": {"iterations": 150}
+        }
+    }
+    import json
+    net.set_options(json.dumps(options))
+
+    # add nodes
+    for _, r in nd.iterrows():
+        tech, sector = r["tech"], r["sector"]
+        color = sector_colors.get(sector, "#888888")
+        net.add_node(tech, label=tech, title=f"{tech} | Sector: {sector}", color=color, size=node_size_base)
+
+    # normalize edge widths for readability
+    if not ed.empty:
+        w = ed["weight"].astype(float).values
+        wmin, wmax = float(np.min(w)), float(np.max(w))
+        if wmax > wmin:
+            widths = 1.0 + (w - wmin) / (wmax - wmin) * edge_width_scale
+        else:
+            widths = np.full_like(w, 1.0)
+        for (src, dst, wei), lw in zip(ed.itertuples(index=False, name=None), widths):
+            net.add_edge(src, dst, value=float(wei), width=float(lw))
+
+    base_out = ctx.get("base_out_dir", "./out")
+    out_dir = out_dir or base_out
+    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
+    out_html = os.path.join(out_dir, "tech_similarity_pyvis.html")
+
+    # Scrivi l'HTML senza aprire il browser (più robusto di show())
+    try:
+        net.write_html(out_html, open_browser=False)
+    except Exception as e:
+        logger.error(f"[plot_interactive_force_pyvis] write_html failed: {e}")
+        raise
+
+    logger.info(f"[plot_interactive_force_pyvis] Saved {out_html}")
+    ctx.setdefault("artifacts", []).append(out_html)
+    return df, ctx
 

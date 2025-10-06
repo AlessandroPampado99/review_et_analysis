@@ -6,3 +6,5 @@ typer>=0.12
 matplotlib>=3.8
 networkx>=3.2
 plotly>=5.22
+pyvis>=0.3.2
+

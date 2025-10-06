@@ -29,6 +29,11 @@ pipeline:
       cmap_name: "tab20"
       seed: 42
       shuffle: false
+      
+  - step: assign_sector_colors   # una volta a monte
+    params:
+      sector_col: "Sector"
+      palette: "tab20"
 
   - step: stats_by_technology
     params:
@@ -85,19 +90,46 @@ pipeline:
       weight_scale: 0.01          # <= divide per 100
       weight_transform: "none"    # opzionale: "sqrt" o "log10"
       min_weight: 0.0
-
-  # 4A) rete statica (PNG)
-  - step: plot_flow_networkx
+      
+  - step: build_carrier_graph
     params:
-      edge_width_min: 0.6
-      edge_width_max: 6.0
-      # out_dir: "C:\\...\\output\\graphs"
+      input_col: "Input"
+      output_col: "Output"
+      weight_mode: "count"        # oppure: "stats" + stats_source_col/metric
+      min_weight: 1
 
-  # 4B) sankey interattivo (HTML + opz. PNG)
+  - step: plot_carrier_networkx
+    params:
+      layout_mode: "sector_columns"
+      num_sector_cols: 6          # <-- 5/6 colonne
+      in_out_offset: 0.035
+      jitter_y: 0.006
+      hide_self_loops: true
+      node_size: 440
+
+
   - step: plot_flow_sankey
     params:
-      save_png: false
-      # out_dir: "C:\\...\\output\\graphs"
+      min_link_value: 0.5
+      top_links_per_source: 10
+      # out_dir: "C:\\...\\out"
+
+  - step: build_tech_similarity_graph
+    params:
+      technology_col: "Technology name"
+      sector_col: "Sector"
+      input_col: "Input"
+      output_col: "Output"
+      weight_mode: "count"     # oppure "jaccard"
+      min_weight: 1
+
+  - step: plot_interactive_force_pyvis
+    params:
+      physics_solver: "forceAtlas2Based"
+      sector_palette: "tab20"
+      edge_width_scale: 3.0
+      # out_dir: "C:\\...\\out"
+
 
 
 output:
