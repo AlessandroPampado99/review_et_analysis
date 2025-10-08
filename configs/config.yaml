@@ -101,11 +101,15 @@ pipeline:
   - step: plot_carrier_networkx
     params:
       layout_mode: "sector_columns"
-      num_sector_cols: 6          # <-- 5/6 colonne
-      in_out_offset: 0.035
-      jitter_y: 0.006
+      num_sector_cols: 6
+      sector_band_mode: "proportional"
+      sector_band_gap: 0.028
+      min_row_spacing: 0.10
+      adaptive_fig: true
+      dense_threshold: 16
+      height_per_node: 0.16
+      jitter_y: 0.004
       hide_self_loops: true
-      node_size: 440
 
 
   - step: plot_flow_sankey

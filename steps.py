@@ -655,22 +655,18 @@ def build_flow_graph(
 def plot_carrier_networkx(
     df: pd.DataFrame,
     ctx: dict,
-    # I/O
     out_dir: str = None,
-    # estetica archi
     edge_width_min: float = 0.6,
     edge_width_max: float = 6.0,
     alpha: float = 0.7,
     connectionstyle: str = "arc3,rad=0.06",
-    # estetica nodi/testi
     tick_labelsize: int = 9,
-    node_size: int = 420,
-    # layout
-    layout_mode: str = "sector_columns",   # "three_column" | "two_column" | "sector_columns"
-    num_sector_cols: int = 6,              # quante colonne orizzontali dedicate ai settori
-    x_pad: float = 0.10,                   # padding laterale (0..0.5)
-    in_out_offset: float = 0.035,          # offset orizzontale delle sotto-colonne (in/mixed/out)
-    sort_within_sector: str = "degree",    # "degree" | "alpha"
+    node_size: int = 900,
+    layout_mode: str = "sector_columns",
+    num_sector_cols: int = 20,
+    x_pad: float = 0.10,
+    in_out_offset: float = 0.035,
+    sort_within_sector: str = "degree",
     jitter_y: float = 0.006,
     hide_self_loops: bool = False,
     sector_col: str = "Sector",
@@ -678,6 +674,14 @@ def plot_carrier_networkx(
     output_col: str = "Output",
     technology_col: str = "Technology name",
     token_separators: list = (";", ",", "|"),
+    # NEW ↓↓↓
+    sector_band_mode: str = "proportional",   # "proportional" | "equal"
+    sector_band_gap: float = 0.02,            # vertical gap between sector bands (0..0.2)
+    min_row_spacing: float = 0.01,           # minimum vertical spacing between nodes within a band
+    adaptive_fig: bool = True,                 # adapt figure height to densest band
+    base_figsize: tuple = (18, 10),            # (w,h) inches; h auto-scaled if adaptive_fig
+    height_per_node: float = 0.16,             # inches added per node over threshold in densest band
+    dense_threshold: int = 10,                 # nodes over this in a band start to grow figure height
     **_,
 ):
     """
@@ -755,60 +759,104 @@ def plot_carrier_networkx(
     deg_df["deg_w"] = deg_df["in_w"] + deg_df["out_w"]
     def _deg(c): return float(deg_df.loc[deg_df["carrier"]==c, "deg_w"].values[0])
 
-    # 6) posizioni
+    # 6) positions
     pos = {}
     rng = np.random.default_rng(42)
 
+    def _stack(names, x_center, y0, y1):
+        """Place 'names' evenly between [y0, y1] with optional jitter."""
+        names = sorted(names, key=lambda c: -_deg(c)) if sort_within_sector=="degree" else sorted(names)
+        n = max(1, len(names))
+        # compute vertical spacing respecting min_row_spacing
+        span = max(0.001, y1 - y0)
+        step = max(span / max(n,1), min_row_spacing)
+        # recompute y-range if step got clamped
+        total = step * (n - 1)
+        if total > span:
+            y0_adj = max(0.01, (y0 + y1)/2 - total/2)
+            y1_adj = min(0.99, y0_adj + total)
+        else:
+            y0_adj, y1_adj = y0, y1
+
+        ys = np.linspace(y0_adj, y1_adj, n) if n > 1 else np.array([(y0+y1)/2])
+        if jitter_y and n > 1:
+            ys = ys + rng.normal(0.0, jitter_y, size=n)
+            ys = np.clip(ys, 0.01, 0.99)
+        for i, name in enumerate(names):
+            pos[name] = (float(x_center), float(ys[i]))
+
     if layout_mode == "sector_columns":
-        # mappa settore -> centro colonna su linspace
-        sectors_sorted = sorted(set(carrier_sector.values()),
-                                key=lambda s: -sum(_deg(c) for c in carriers if carrier_sector[c]==s))
+        # sectors ordered by total degree (dense first)
+        sectors_sorted = sorted(
+            set(carrier_sector.values()),
+            key=lambda s: -sum(_deg(c) for c in carriers if carrier_sector[c]==s)
+        )
         ncols = max(1, min(num_sector_cols, len(sectors_sorted)))
         xs_grid = np.linspace(x_pad, 1.0 - x_pad, ncols)
 
+        # count per sector (for band sizing)
+        sec_counts = {
+            s: sum(1 for c in carriers if carrier_sector[c]==s)
+            for s in sectors_sorted
+        }
+        total_nodes = sum(sec_counts.values())
+        # assign vertical bands [y_start, y_end] per sector
+        bands = {}
+        if sector_band_mode == "equal" or total_nodes == 0:
+            band_height = (1.0 - sector_band_gap*(len(sectors_sorted)-1)) / max(1, len(sectors_sorted))
+            y = 0.02
+            for s in sectors_sorted:
+                y0 = y
+                y1 = min(0.98, y0 + band_height)
+                bands[s] = (y0, y1)
+                y = y1 + sector_band_gap
+        else:
+            # proportional to count, enforcing a minimum height
+            min_h = 0.05  # minimum band height
+            weights = np.array([max(1, sec_counts[s]) for s in sectors_sorted], dtype=float)
+            weights = weights / weights.sum()
+            free_h = 1.0 - sector_band_gap*(len(sectors_sorted)-1) - min_h*len(sectors_sorted)
+            free_h = max(0.0, free_h)
+            heights = min_h + free_h*weights
+            y = 0.02
+            for s, h in zip(sectors_sorted, heights):
+                y0 = y
+                y1 = min(0.98, y0 + float(h))
+                bands[s] = (y0, y1)
+                y = y1 + sector_band_gap
+
+        # place nodes inside bands; each sector-column has 3 sub-columns
         sec2x = {}
         for idx, s in enumerate(sectors_sorted):
             sec2x[s] = xs_grid[idx % ncols]
 
-        def _stack(names, x_center, offset):
-            names = sorted(names, key=lambda c: -_deg(c)) if sort_within_sector=="degree" else sorted(names)
-            n = max(1, len(names))
-            ys = np.linspace(0.02, 0.98, n)
-            if jitter_y and n > 1:
-                ys = ys + rng.normal(0.0, jitter_y, size=n)
-                ys = np.clip(ys, 0.01, 0.99)
-            for i, name in enumerate(names):
-                pos[name] = (float(x_center + offset), float(ys[i]))
+        # collect band max densities for adaptive sizing
+        band_max_nodes = 0
 
-        # per ciascun settore, distribuisci input/mixed/output con piccoli offset
         for s in sectors_sorted:
             x0 = sec2x[s]
+            y0, y1 = bands[s]
             in_names   = [c for c in carriers if carrier_sector[c]==s and c in pure_inputs]
             mix_names  = [c for c in carriers if carrier_sector[c]==s and c in mixed]
             out_names  = [c for c in carriers if carrier_sector[c]==s and c in pure_outputs]
-            _stack(in_names,  x0, -in_out_offset)
-            _stack(mix_names, x0, 0.0)
-            _stack(out_names, x0, +in_out_offset)
+            band_max_nodes = max(band_max_nodes, len(in_names), len(mix_names), len(out_names))
+
+            _stack(in_names,  x0 - in_out_offset, y0, y1)
+            _stack(mix_names, x0,                 y0, y1)
+            _stack(out_names, x0 + in_out_offset, y0, y1)
 
     else:
-        # fallback: modalità precedenti
-        def _order(names): 
-            return sorted(names, key=lambda c: -_deg(c)) if sort_within_sector=="degree" else sorted(names)
+        # previous modes (two/three columns), keep your existing code here
+        cols = []
         if layout_mode == "three_column":
             cols = [ (sorted(pure_inputs, key=lambda c:-_deg(c)), 0.0),
-                     (sorted(mixed, key=lambda c:-_deg(c)), 0.5),
-                     (sorted(pure_outputs, key=lambda c:-_deg(c)), 1.0) ]
+                     (sorted(mixed,      key=lambda c:-_deg(c)), 0.5),
+                     (sorted(pure_outputs,key=lambda c:-_deg(c)), 1.0) ]
         else:
-            cols = [ (sorted(in_set, key=lambda c:-_deg(c)), 0.0),
+            cols = [ (sorted(in_set,  key=lambda c:-_deg(c)), 0.0),
                      (sorted(out_set, key=lambda c:-_deg(c)), 1.0) ]
         for names, x in cols:
-            n = max(1, len(names))
-            ys = np.linspace(0.02, 0.98, n)
-            if jitter_y and n > 1:
-                ys = ys + rng.normal(0.0, jitter_y, size=n)
-                ys = np.clip(ys, 0.01, 0.99)
-            for i, name in enumerate(names):
-                pos[name] = (x, float(ys[i]))
+            _stack(names, x, 0.02, 0.98)
 
     # 7) grafo + larghezze
     G = nx.DiGraph()
@@ -827,7 +875,13 @@ def plot_carrier_networkx(
     _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
     out_fp = os.path.join(out_dir, f"carrier_network_{_slugify(weight_name)}_{layout_mode}.png")
 
-    plt.figure(figsize=(18, 10))
+    fig_w, fig_h = base_figsize
+    if adaptive_fig and layout_mode == "sector_columns":
+        # grow with densest band beyond threshold
+        grow = max(0, band_max_nodes - dense_threshold)
+        fig_h = fig_h + grow * height_per_node
+    plt.figure(figsize=(fig_w, fig_h))
+
     # colori per settore
     node_colors = [sector_colors.get(carrier_sector[c], "#CCCCCC") for c in carriers]
     nx.draw_networkx_nodes(G, pos, nodelist=carriers, node_color=node_colors,
