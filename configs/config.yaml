@@ -83,6 +83,7 @@ pipeline:
       input_col: "Input"
       technology_col: "Technology name"
       output_col: "Output"
+      sector_col: "Sector"
       token_separators: [";", ",", "|"]
       weight_mode: "stats"             # "stats" | "column" | "uniform"
       weight_stats_source_col: "CAPEX" # da ctx["stats"]["CAPEX"]
@@ -114,9 +115,14 @@ pipeline:
 
   - step: plot_flow_sankey
     params:
-      min_link_value: 0.5
+      min_link_value: 0.1
       top_links_per_source: 10
-      # out_dir: "C:\\...\\out"
+      group_others: true
+      link_color_mode: "source"
+      order_by: "throughput"
+      wrap_labels: true
+      save_png: true
+      # out_dir: "C:\\path\\to\\out"
 
   - step: build_tech_similarity_graph
     params:
@@ -129,10 +135,19 @@ pipeline:
 
   - step: plot_interactive_force_pyvis
     params:
-      physics_solver: "forceAtlas2Based"
-      sector_palette: "tab20"
-      edge_width_scale: 3.0
-      # out_dir: "C:\\...\\out"
+      layout_scale: 2
+      min_node_distance_px: 60
+      repel_iters: 10
+      repel_strength: 0.4
+
+      # nodi più piccoli
+      node_size_min: 8
+      node_size_max: 24
+      node_font_size: 13
+
+      # un po' più grande nel complesso
+      pos_scale_px: 520
+      canvas_height: "1000px"
 
 
 

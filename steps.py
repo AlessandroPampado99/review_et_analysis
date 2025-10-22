@@ -22,6 +22,7 @@ import logging
 import networkx as nx
 import plotly.graph_objects as go
 from pyvis.network import Network
+import textwrap
 logger = logging.getLogger("pipeline")
 
 
@@ -903,24 +904,76 @@ def plot_carrier_networkx(
     return df, ctx
 
 
+logger = logging.getLogger("pipeline")
+
+def _wrap_label(s: str, max_chars: int = 18) -> str:
+    """Wrap a label at spaces, max width max_chars, preserving short words."""
+    if not isinstance(s, str):
+        s = str(s)
+    # avoid breaking very short labels
+    if len(s) <= max_chars:
+        return s
+    return "\n".join(textwrap.wrap(s, width=max_chars, break_long_words=False))
 
 @step("plot_flow_sankey")
 def plot_flow_sankey(
     df: pd.DataFrame,
     ctx: dict,
     out_dir: str = None,
-    min_link_value: float = 0.0,        # drop small links
-    group_others: bool = True,          # group small links into "Other"
-    others_label: str = "Other",
-    top_links_per_source: int = None,   # keep only top-K per source node (after threshold)
-    tech_color_alpha: float = 0.9,
-    sort_nodes: bool = True,            # sort nodes alphabetically within each column
+
+    # --- filtering controls (double threshold, per-layer top-K) ---
+    min_link_value_in: float = 0.0,       # threshold for Input->Tech links
+    min_link_value_out: float = 0.0,      # threshold for Tech->Output links
+    top_links_per_source_in: int = None,  # keep only top-K per input source (after threshold)
+    top_links_per_source_out: int = None, # keep only top-K per tech source (after threshold)
+
+    # --- grouping of small links into "Other" nodes (optional) ---
+    group_others_in: bool = False,        # aggregate small Input->Tech residuals per input into "Other inputs"
+    group_others_out: bool = True,        # aggregate small Tech->Output residuals per tech into "Other outputs"
+    others_label_in: str = "Other inputs",
+    others_label_out: str = "Other outputs",
+
+    # --- node ordering & labels ---
+    sort_nodes_by: str = "throughput",    # "throughput" | "alpha"
+    wrap_labels: bool = True,
+    wrap_max_chars: int = 20,
+
+    # --- node appearance ---
+    node_pad: int = 12,
+    node_thickness: int = 14,
+    tech_color_alpha: float = 0.90,
+    font_size: int = 12,
+    title: str = None,
+
+    # --- link colors ---
+    link_color_mode: str = "source",      # "source" | "target" | "static"
+    static_link_rgba: str = "rgba(160,160,160,0.35)",
+
+    # --- optional role-based positioning (inputs left, outputs right, techs spread by role) ---
+    use_role_positioning: bool = True,    # if True, set x/y arrays
+    arrangement: str = "snap",            # "snap" honors x/y; otherwise plotly arranges
+    x_input: float = 0.02,
+    x_output: float = 0.98,
+    tech_x_min: float = 0.07,
+    tech_x_max: float = 0.93,
+    y_pad: float = 0.04,                  # top/bottom padding (0..0.5)
+
+    # --- export ---
+    save_png: bool = False,
+    png_scale: int = 2,
     **_,
 ):
     """
-    Cleaner Sankey diagram (HTML) using flow_graph from build_flow_graph.
-    Applies thresholding and optional 'Other' grouping.
+    Clean Sankey from ctx['flow_graph'] with:
+      - dual thresholds (in/out) and per-layer Top-K
+      - optional 'Other' aggregation on each side
+      - node label wrapping
+      - link coloring by {source|target|static}
+      - optional role-based positioning: Input at x_input, Output at x_output, Tech spread by out/(in+out)
+      - tooltips showing src, dst, and weight (with weight_name)
+      - optional PNG export (requires kaleido)
     """
+    # --- load graph from context ---
     fg = ctx.get("flow_graph")
     if not fg:
         raise RuntimeError("flow_graph not found in ctx. Run 'build_flow_graph' first.")
@@ -929,79 +982,263 @@ def plot_flow_sankey(
     edges_df = fg["edges_df"].copy()
     weight_name = fg.get("weight_name", "weight")
 
-    # split by type and sort
-    if sort_nodes:
-        inputs = sorted(nodes_df[nodes_df["type"]=="input"]["name"].tolist())
-        techs  = sorted(nodes_df[nodes_df["type"]=="tech"]["name"].tolist())
-        outputs= sorted(nodes_df[nodes_df["type"]=="output"]["name"].tolist())
+    # --- split by type ---
+    inputs = nodes_df[nodes_df["type"] == "input"]["name"].tolist()
+    techs  = nodes_df[nodes_df["type"] == "tech"]["name"].tolist()
+    outputs= nodes_df[nodes_df["type"] == "output"]["name"].tolist()
+
+    # optional ordering by throughput
+    if sort_nodes_by == "throughput":
+        def _throughput(names):
+            s = pd.concat([
+                edges_df.loc[edges_df["src"].isin(names), ["src", "weight"]].rename(columns={"src": "name"}),
+                edges_df.loc[edges_df["dst"].isin(names), ["dst", "weight"]].rename(columns={"dst": "name"})
+            ], ignore_index=True)
+            return s.groupby("name")["weight"].sum().to_dict() if not s.empty else {}
+        th_in  = _throughput(inputs)
+        th_t   = _throughput(techs)
+        th_out = _throughput(outputs)
+        inputs.sort(key=lambda n: -float(th_in.get(n, 0.0)))
+        techs.sort(key=lambda n: -float(th_t.get(n, 0.0)))
+        outputs.sort(key=lambda n: -float(th_out.get(n, 0.0)))
     else:
-        inputs = nodes_df[nodes_df["type"]=="input"]["name"].tolist()
-        techs  = nodes_df[nodes_df["type"]=="tech"]["name"].tolist()
-        outputs= nodes_df[nodes_df["type"]=="output"]["name"].tolist()
+        inputs.sort(); techs.sort(); outputs.sort()
+
+    # label wrapping
+    if wrap_labels:
+        label_map = {n: _wrap_label(n, wrap_max_chars) for n in (inputs + techs + outputs)}
+    else:
+        label_map = {n: n for n in (inputs + techs + outputs)}
 
     ordered = inputs + techs + outputs
     node_index = {name: i for i, name in enumerate(ordered)}
 
-    # threshold links
-    ed = edges_df.copy()
-    ed = ed[ed["weight"] >= float(min_link_value)]
-
-    # top-K per source (optional)
-    if top_links_per_source and top_links_per_source > 0:
-        ed = (
-            ed.sort_values(["src", "weight"], ascending=[True, False])
-              .groupby("src", as_index=False)
-              .head(top_links_per_source)
-        )
-
-    # group small links into "Other"
-    if group_others:
-        # detect which targets are missing after filtering and redirect them to "Other"
-        # simpler: aggregate remaining small mass by src_type to one sink per column end
-        # We'll only group on the "tech->output" side for clarity
-        # (but you could extend to inputs similarly)
-        pass  # keep simple; thresholding + top-K already cleans a lot
-
-    # Labels + colors: techs keep their color_map
-    labels = ordered
-    color_map = ctx.get("color_map", {})
+    # ---- COLORS FOR NODES ----
+    color_map = ctx.get("color_map", {})  # technology -> hex
     node_colors = []
     for name in ordered:
         if name in techs:
             rgba = mcolors.to_rgba(color_map.get(name, "#4C78A8"), alpha=tech_color_alpha)
         elif name in inputs:
-            rgba = mcolors.to_rgba("#BBBBBB", alpha=0.8)
+            rgba = mcolors.to_rgba("#BBBBBB", alpha=0.85)
         else:
-            rgba = mcolors.to_rgba("#DDDDDD", alpha=0.8)
+            rgba = mcolors.to_rgba("#DDDDDD", alpha=0.85)
         node_colors.append(f"rgba({int(rgba[0]*255)},{int(rgba[1]*255)},{int(rgba[2]*255)},{rgba[3]:.2f})")
 
-    # build source/target/value arrays
-    sources, targets, values = [], [], []
-    for _, r in ed.iterrows():
-        if r["src"] not in node_index or r["dst"] not in node_index:
-            continue
-        sources.append(node_index[r["src"]])
-        targets.append(node_index[r["dst"]])
-        values.append(float(r["weight"]))
+    # ---- SPLIT LINKS IN TWO LAYERS ----
+    ed = edges_df.copy()
+    ed_in  = ed[ed["dst"].isin(techs)   & ed["src"].isin(inputs)].copy()   # input -> tech
+    ed_out = ed[ed["src"].isin(techs)   & ed["dst"].isin(outputs)].copy()  # tech  -> output
 
-    # figure
+    # thresholds
+    ed_in  = ed_in[ed_in["weight"]  >= float(min_link_value_in)]
+    ed_out = ed_out[ed_out["weight"] >= float(min_link_value_out)]
+
+    # top-K per source (optional)
+    if isinstance(top_links_per_source_in, int) and top_links_per_source_in > 0:
+        ed_in = (ed_in.sort_values(["src", "weight"], ascending=[True, False])
+                      .groupby("src", as_index=False).head(top_links_per_source_in))
+    if isinstance(top_links_per_source_out, int) and top_links_per_source_out > 0:
+        ed_out = (ed_out.sort_values(["src", "weight"], ascending=[True, False])
+                       .groupby("src", as_index=False).head(top_links_per_source_out))
+
+    # ---- GROUP 'OTHER' (heuristic on residuals) ----
+    def _inject_other_node(name_other: str, side: str):
+        """Ensure 'Other' node exists in the proper column list and update indexes."""
+        nonlocal ordered, node_index
+        if side == "out":
+            if name_other not in outputs:
+                outputs.append(name_other)
+        else:  # "in"
+            if name_other not in inputs:
+                inputs.append(name_other)
+        ordered = inputs + techs + outputs
+        node_index = {name: i for i, name in enumerate(ordered)}
+
+    def _group_others(df_links: pd.DataFrame, side: str):
+        """Aggregate small links (below median per source) into an 'Other' sink node."""
+        if df_links.empty:
+            return df_links
+        label_other = others_label_in if side == "in" else others_label_out
+        _inject_other_node(label_other, side=side)
+
+        grouped_parts = []
+        for src, chunk in df_links.groupby("src"):
+            if len(chunk) <= 2:
+                grouped_parts.append(chunk)
+                continue
+            thr = float(chunk["weight"].median())
+            keep = chunk[chunk["weight"] >= thr]
+            other_val = float(chunk[chunk["weight"] < thr]["weight"].sum())
+            if other_val > 0:
+                grouped_parts.append(keep)
+                grouped_parts.append(pd.DataFrame([{"src": src, "dst": label_other, "weight": other_val}]))
+            else:
+                grouped_parts.append(chunk)
+        return pd.concat(grouped_parts, ignore_index=True)
+
+    if group_others_in:
+        ed_in = _group_others(ed_in, side="in")
+    if group_others_out:
+        ed_out = _group_others(ed_out, side="out")
+
+    # ---- rebuild labels/colors after possible 'Other' injection ----
+    ordered = inputs + techs + outputs
+    labels = [label_map.get(n, n) for n in ordered]
+    node_colors = []
+    for name in ordered:
+        if name in techs:
+            rgba = mcolors.to_rgba(ctx.get("color_map", {}).get(name, "#4C78A8"), alpha=tech_color_alpha)
+        elif name in inputs:
+            rgba = mcolors.to_rgba("#BBBBBB", alpha=0.85)
+        else:
+            rgba = mcolors.to_rgba("#DDDDDD", alpha=0.85)
+        node_colors.append(f"rgba({int(rgba[0]*255)},{int(rgba[1]*255)},{int(rgba[2]*255)},{rgba[3]:.2f})")
+    node_index = {name: i for i, name in enumerate(ordered)}  # rebuild
+
+    # ---- build sankey arrays (concat the two layers) ----
+    def _build_arrays(df_links: pd.DataFrame):
+        src_idx = [node_index.get(s, None) for s in df_links["src"]]
+        dst_idx = [node_index.get(t, None) for t in df_links["dst"]]
+        mask = [i is not None and j is not None for i, j in zip(src_idx, dst_idx)]
+        sources = [i for i, m in zip(src_idx, mask) if m]
+        targets = [j for j, m in zip(dst_idx, mask) if m]
+        values  = [float(w) for w, m in zip(df_links["weight"], mask) if m]
+        return sources, targets, values
+
+    s1, t1, v1 = _build_arrays(ed_in)
+    s2, t2, v2 = _build_arrays(ed_out)
+    sources = s1 + s2
+    targets = t1 + t2
+    values  = v1 + v2
+
+    # ---- link colors ----
+    link_colors = []
+    if link_color_mode in ("source", "target"):
+        cmap = ctx.get("color_map", {})
+        for s, t in zip(sources, targets):
+            node_name = ordered[s] if link_color_mode == "source" else ordered[t]
+            if node_name in techs:  # vivid only for tech-origin/tech-target
+                rgba = mcolors.to_rgba(cmap.get(node_name, "#4C78A8"), alpha=0.45)
+            else:
+                rgba = mcolors.to_rgba("#999999", alpha=0.25)
+            link_colors.append(f"rgba({int(rgba[0]*255)},{int(rgba[1]*255)},{int(rgba[2]*255)},{rgba[3]:.2f})")
+    else:
+        link_colors = [static_link_rgba] * len(sources)
+
+    # ---- tooltips ----
+    src_labels = [labels[s] for s in sources]
+    dst_labels = [labels[t] for t in targets]
+    customdata = np.vstack([src_labels, dst_labels, np.array(values, dtype=float)]).T
+    hovertemplate = (
+        "<b>%{customdata[0]}</b> → <b>%{customdata[1]}</b><br>"
+        f"weight ({weight_name}): <b>%{{customdata[2]:.3g}}</b><extra></extra>"
+    )
+
+    # ---- optional role-based positioning ----
+    sankey_node_kwargs = dict(
+        pad=node_pad, thickness=node_thickness,
+        line=dict(color="black", width=0.4),
+        label=labels, color=node_colors
+    )
+
+    if use_role_positioning:
+        # totals in/out per tech
+        w_in  = (ed_in .groupby("dst")["weight"].sum(min_count=1) if not ed_in.empty else pd.Series(dtype=float)).to_dict()
+        w_out = (ed_out.groupby("src")["weight"].sum(min_count=1) if not ed_out.empty else pd.Series(dtype=float)).to_dict()
+        tech_role, tech_throughput = {}, {}
+        for t in techs:
+            tin  = float(w_in.get(t, 0.0))
+            tout = float(w_out.get(t, 0.0))
+            tot  = tin + tout
+            s = (tout / tot) if tot > 0 else 0.5
+            tech_role[t] = s
+            tech_throughput[t] = tot
+
+        def _even_y(names):
+            n = max(1, len(names))
+            y0, y1 = y_pad, 1.0 - y_pad
+            return np.linspace(y0, y1, n) if n > 1 else np.array([(y0 + y1) / 2])
+
+        # choose order within columns (throughput-desc if requested)
+        if sort_nodes_by == "throughput":
+            inputs_sorted  = sorted(inputs,  key=lambda n: -sum(v for s, v in zip(sources, values) if ordered[s] == n))
+            techs_sorted   = sorted(techs,   key=lambda n: -tech_throughput.get(n, 0.0))
+            outputs_sorted = sorted(outputs, key=lambda n: -sum(v for t, v in zip(targets, values) if ordered[t] == n))
+        else:
+            inputs_sorted, techs_sorted, outputs_sorted = inputs, techs, outputs
+
+        x_arr = np.zeros(len(ordered), dtype=float)
+        y_arr = np.zeros(len(ordered), dtype=float)
+
+        # inputs
+        in_ys = _even_y(inputs_sorted)
+        for i, name in enumerate(inputs_sorted):
+            idx = node_index[name]
+            x_arr[idx] = x_input
+            y_arr[idx] = in_ys[i]
+
+        # techs
+        tech_ys = _even_y(techs_sorted)
+        for i, name in enumerate(techs_sorted):
+            idx = node_index[name]
+            role = tech_role.get(name, 0.5)
+            # add small jitter proportional to index within similar-role group
+            rng = np.random.default_rng(42)
+            bins = np.array([0.0, 0.08, 0.25, 0.5, 0.75, 0.92, 1.0])
+            bin_idx = np.digitize(role, bins) - 1
+            span = tech_x_max - tech_x_min
+            x_base = tech_x_min + bin_idx / (len(bins)-1) * span
+            x_arr[idx] = x_base + 0.02 * (rng.random() - 0.5)  # leggero jitter locale
+
+            y_arr[idx] = tech_ys[i]
+
+        # outputs
+        out_ys = _even_y(outputs_sorted)
+        for i, name in enumerate(outputs_sorted):
+            idx = node_index[name]
+            x_arr[idx] = x_output
+            y_arr[idx] = out_ys[i]
+
+        sankey_node_kwargs.update(dict(x=x_arr, y=y_arr))
+        arrangement_used = arrangement
+    else:
+        arrangement_used = "perpendicular"
+
+    # ---- figure ----
     fig = go.Figure(data=[go.Sankey(
-        node=dict(
-            pad=12, thickness=14, line=dict(color="black", width=0.5),
-            label=labels, color=node_colors
+        node=sankey_node_kwargs,
+        link=dict(
+            source=sources, target=targets, value=values,
+            color=link_colors, customdata=customdata, hovertemplate=hovertemplate
         ),
-        link=dict(source=sources, target=targets, value=values)
+        arrangement=arrangement_used
     )])
-    fig.update_layout(title_text=f"Flows (weight = {weight_name})", font=dict(size=12))
 
+    the_title = title or f"Flows (weight = {weight_name})"
+    fig.update_layout(title_text=the_title, font=dict(size=font_size))
+
+    # ---- save ----
     base_out = ctx.get("base_out_dir", "./out")
     out_dir = out_dir or base_out
     _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
-    out_html = os.path.join(out_dir, f"sankey_clean_{_slugify(weight_name)}.html")
+    out_html = os.path.join(out_dir, f"sankey_{_slugify(weight_name)}.html")
     fig.write_html(out_html)
-    logger.info(f"[plot_flow_sankey_clean] Saved {out_html}")
+    logger.info(f"[plot_flow_sankey] Saved HTML to {out_html}")
     ctx.setdefault("artifacts", []).append(out_html)
+
+    if save_png:
+        try:
+            out_png = os.path.join(out_dir, f"sankey_{_slugify(weight_name)}.png")
+            fig.write_image(out_png, scale=int(png_scale))
+            logger.info(f"[plot_flow_sankey] Saved PNG to {out_png}")
+            ctx["artifacts"].append(out_png)
+        except Exception as e:
+            logger.warning(f"[plot_flow_sankey] PNG export failed (install kaleido): {e}")
+
     return df, ctx
+
+
 
 
 
@@ -1136,76 +1373,181 @@ def plot_interactive_force_pyvis(
     df: pd.DataFrame,
     ctx: dict,
     out_dir: str = None,
-    physics_solver: str = "forceAtlas2Based",   # "forceAtlas2Based" | "barnesHut" | "repulsion"
-    sector_palette: str = "tab20",              # Matplotlib colormap for sectors
-    node_size_base: int = 10,
-    edge_width_scale: float = 2.0,              # multiply weight for line width
+
+    # --- static spring layout (networkx) ---
+    spring_k: float = None,
+    spring_iterations: int = 300,
+    spring_seed: int = 42,
+    pos_scale_px: int = 450,
+    center_px: tuple = (0, 0),
+
+    # NEW: global scaling & spacing controls
+    layout_scale: float = 1.4,          # multiply all distances after spring_layout
+    min_node_distance_px: float = 48.0, # enforce minimum pairwise distance
+    repel_iters: int = 8,               # iterations of pairwise repulsion
+    repel_strength: float = 0.35,       # how hard to push per violation (0..1)
+
+    # node sizing & styling
+    node_size_metric: str = "strength",  # "strength" | "degree"
+    node_size_min: int = 8,              # ↓ smaller default
+    node_size_max: int = 28,             # ↓ smaller default
+    node_font_size: int = 14,            # slightly smaller labels
+
+    # edge styling
+    edge_width_scale: float = 2.2,
+    edge_color_rgba: str = "rgba(200,200,200,0.6)",
+
+    # colors & canvas
+    sector_palette: str = "tab20",
+    bgcolor: str = "#111111",
+    font_color: str = "#EEEEEE",
+    canvas_width: str = "100%",
+    canvas_height: str = "900px",
     **_,
 ):
     """
-    Interactive force-directed graph (PyVis) of technology similarity.
-    Nodes colored by Sector, edge width ∝ weight.
+    Fixed, spherical (spring) layout → then scaled & repelled to avoid overlaps.
     """
     tg = ctx.get("tech_graph")
     if not tg:
         raise RuntimeError("tech_graph not found. Run 'build_tech_similarity_graph' first.")
-    nd, ed = tg["nodes_df"], tg["edges_df"]
+    nd, ed = tg["nodes_df"].copy(), tg["edges_df"].copy()
 
-    # sector -> color
+    import numpy as np
+    import json, math
+    import networkx as nx
     import matplotlib.cm as cm, matplotlib.colors as mcolors
-    sectors = sorted(nd["sector"].unique().tolist())
-    cmap = cm.get_cmap(sector_palette, len(sectors))
-    sector_colors = {s: mcolors.to_hex(cmap(i)) for i, s in enumerate(sectors)}
+    from pyvis.network import Network
+    import pandas as pd
 
-    net = Network(height="800px", width="100%", directed=False, notebook=False, bgcolor="#111111", font_color="#EEEEEE")
-    net.toggle_physics(True)
-    options = {
-        "nodes": {
-            "shape": "dot",
-            "scaling": {"min": 5, "max": 40}
-        },
-        "edges": {
-            "color": {"color": "#aaaaaa"},
-            "smooth": {"type": "dynamic"}
-        },
-        "physics": {
-            "solver": physics_solver,
-            "stabilization": {"iterations": 150}
-        }
-    }
-    import json
-    net.set_options(json.dumps(options))
+    # -- colors
+    sector_colors = ctx.get("sector_colors")
+    if not sector_colors:
+        sectors = sorted(nd["sector"].fillna("Unknown").unique().tolist())
+        cmap = cm.get_cmap(sector_palette, len(sectors))
+        sector_colors = {s: mcolors.to_hex(cmap(i)) for i, s in enumerate(sectors)}
+        ctx["sector_colors"] = sector_colors
 
-    # add nodes
-    for _, r in nd.iterrows():
-        tech, sector = r["tech"], r["sector"]
-        color = sector_colors.get(sector, "#888888")
-        net.add_node(tech, label=tech, title=f"{tech} | Sector: {sector}", color=color, size=node_size_base)
+    # -- centralities
+    if ed.empty:
+        deg_src = pd.Series(dtype=float); deg_dst = pd.Series(dtype=float)
+        str_src = pd.Series(dtype=float); str_dst = pd.Series(dtype=float)
+    else:
+        deg_src = ed.groupby("src")["weight"].size()
+        deg_dst = ed.groupby("dst")["weight"].size()
+        str_src = ed.groupby("src")["weight"].sum()
+        str_dst = ed.groupby("dst")["weight"].sum()
+    deg_map = (deg_src.add(deg_dst, fill_value=0)).to_dict()
+    str_map = (str_src.add(str_dst, fill_value=0.0)).to_dict()
 
-    # normalize edge widths for readability
+    vals = np.array([float((deg_map if node_size_metric.lower()=="degree" else str_map).get(t, 0.0))
+                     for t in nd["tech"]], dtype=float)
+    if vals.size and np.nanmax(vals) > np.nanmin(vals):
+        ns = (vals - np.nanmin(vals)) / (np.nanmax(vals) - np.nanmin(vals))
+    else:
+        ns = np.zeros_like(vals)
+    node_sizes = node_size_min + ns * (node_size_max - node_size_min)
+    size_map = dict(zip(nd["tech"], node_sizes))
+
+    # -- build graph for layout
+    G = nx.Graph()
+    G.add_nodes_from(nd["tech"].tolist())
+    for src, dst, w in ed.itertuples(index=False, name=None):
+        G.add_edge(src, dst, weight=float(w))
+
+    # -- spring
+    pos = nx.spring_layout(G, k=spring_k, iterations=int(spring_iterations),
+                           seed=int(spring_seed), weight="weight", dim=2) if len(G) else {}
+    cx, cy = center_px
+
+    # -- map to px + global scale
+    coords = {n: (cx + float(x) * pos_scale_px * layout_scale,
+                  cy + float(y) * pos_scale_px * layout_scale)
+              for n, (x, y) in pos.items()}
+
+    # -- post-layout repulsion to enforce min distance (physics remains OFF)
+    if len(coords) > 1 and min_node_distance_px > 0 and repel_iters > 0:
+        nodes = list(coords.keys())
+        arr = np.array([coords[n] for n in nodes], dtype=float)
+
+        def _repel_once(a: np.ndarray, dmin: float, k: float):
+            # pairwise pushes for any pair closer than dmin
+            n = a.shape[0]
+            for i in range(n):
+                for j in range(i+1, n):
+                    dx = a[j,0] - a[i,0]
+                    dy = a[j,1] - a[i,1]
+                    dist = math.hypot(dx, dy)
+                    if dist < 1e-9:
+                        # split slightly in a random small direction
+                        shift = dmin * 0.5
+                        a[i,0] -= shift; a[j,0] += shift
+                        continue
+                    if dist < dmin:
+                        # push apart proportionally to how much they violate dmin
+                        push = (dmin - dist) * k
+                        ux, uy = dx/dist, dy/dist
+                        a[i,0] -= ux * push * 0.5
+                        a[i,1] -= uy * push * 0.5
+                        a[j,0] += ux * push * 0.5
+                        a[j,1] += uy * push * 0.5
+            return a
+
+        for _ in range(int(repel_iters)):
+            arr = _repel_once(arr, float(min_node_distance_px), float(repel_strength))
+        coords = {n: tuple(arr[i]) for i, n in enumerate(nodes)}
+
+    # -- edge widths
     if not ed.empty:
         w = ed["weight"].astype(float).values
-        wmin, wmax = float(np.min(w)), float(np.max(w))
-        if wmax > wmin:
-            widths = 1.0 + (w - wmin) / (wmax - wmin) * edge_width_scale
-        else:
-            widths = np.full_like(w, 1.0)
-        for (src, dst, wei), lw in zip(ed.itertuples(index=False, name=None), widths):
-            net.add_edge(src, dst, value=float(wei), width=float(lw))
+        wmin, wmax = float(np.nanmin(w)), float(np.nanmax(w))
+        widths = 1.0 + ((w - wmin) / (wmax - wmin) * edge_width_scale) if wmax > wmin else np.full_like(w, 1.0)
+    else:
+        widths = np.array([])
 
+    # -- PyVis (physics OFF, nodes fixed)
+    net = Network(height=canvas_height, width=canvas_width, directed=False,
+                  notebook=False, bgcolor=bgcolor, font_color=font_color)
+    options = {
+        "nodes": {"shape":"dot","scaling":{"min":node_size_min,"max":node_size_max},
+                  "font":{"size":node_font_size,"strokeWidth":2}},
+        "edges": {"color":{"color":edge_color_rgba},"smooth":{"type":"dynamic"}},
+        "physics": {"enabled": False},
+        "interaction": {"hover": True, "zoomView": True, "dragNodes": False}
+    }
+    net.set_options(json.dumps(options))
+
+    # nodes
+    for tech, sector in nd[["tech","sector"]].itertuples(index=False, name=None):
+        color = sector_colors.get(sector, "#888888")
+        size_val = float(size_map.get(tech, node_size_min))
+        x, y = coords.get(tech, (0.0, 0.0))
+        title = (f"<b>{tech}</b><br>Sector: {sector}<br>"
+                 f"Degree: {float(deg_map.get(tech, 0.0)):.0f}<br>"
+                 f"Strength: {float(str_map.get(tech, 0.0)):.3g}")
+        net.add_node(tech, label=tech, title=title, color=color, size=size_val,
+                     x=float(x), y=float(y), fixed={"x": True, "y": True})
+
+    # edges
+    if not ed.empty:
+        for i, (src, dst, wei) in enumerate(ed.itertuples(index=False, name=None)):
+            net.add_edge(src, dst, value=float(wei), width=float(widths[i]),
+                         title=f"{src} ↔ {dst}<br>weight: {float(wei):.3g}")
+
+    # save
     base_out = ctx.get("base_out_dir", "./out")
     out_dir = out_dir or base_out
     _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
     out_html = os.path.join(out_dir, "tech_similarity_pyvis.html")
-
-    # Scrivi l'HTML senza aprire il browser (più robusto di show())
     try:
         net.write_html(out_html, open_browser=False)
     except Exception as e:
         logger.error(f"[plot_interactive_force_pyvis] write_html failed: {e}")
         raise
-
     logger.info(f"[plot_interactive_force_pyvis] Saved {out_html}")
     ctx.setdefault("artifacts", []).append(out_html)
     return df, ctx
+
+
+
 
