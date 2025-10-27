@@ -17,7 +17,7 @@ pipeline:
 
   - step: coerce_numeric
     params:
-      columns: ["CAPEX", "OPEX", "lifetime", "efficiency"]
+      columns: ["CAPEX", "OPEX", "Lifetime", "Efficiency", "Technology readiness level"]
 
   - step: filter_rows
     params:
@@ -38,24 +38,45 @@ pipeline:
   - step: stats_by_technology
     params:
       technology_col: "Technology name"
-      columns: ["CAPEX", "OPEX", "lifetime", "efficiency"]
+      columns: ["CAPEX", "OPEX", "Lifetime", "Efficiency", "Technology readiness level"]
       metrics: ["mean", "median", "min", "max", "count", "std"]
       output_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\stats"
 
-  # bar plot for CAPEX
-  - step: plot_bar_by_technology
+    # 1) Costruisci la bibliografia dal foglio Excel
+  - step: build_bibliography_from_excel
     params:
-      stats_source_col: "CAPEX"
-      value_col: "mean"
-      error_col: "std"
-      count_col: "count"
-      # top_n: 20
-      out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\plots\\capex"
+      excel_path: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\input\\input_dataset.xlsx"
+      sheet: "bib_information"
+      out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\bib"
+      bib_filename: "bibliography.bib"
+      bib_key_style: "authoryear_slug"   # o "slug_title"
 
+  # 2) Genera la tabella per tecnologia con \cite{...}
+  - step: build_tech_summary_table
+    params:
+      technology_col: "Technology name"
+      input_col: "Input"
+      output_col: "Output"
+      input_sector_col: "Input Sector"
+      output_sector_col: "Output Sector"
+      title_col: "Title"
+
+      out_dir: "C:\\Users\\aless\\Desktop\\PhD_Pisa\\2025_01_10\\review_et_analysis\\output\\tables"
+      csv_name: "tech_summary.csv"
+      tex_name: "tech_summary.tex"
+      long_csv_name: "tech_citations_long.csv"
+
+      latex_longtable: true
+      latex_caption: "Technology summary (inputs/outputs/sectors and references)"
+      latex_label: "tab:tech_summary"
+      use_bib_citations: true
+      cite_cmd: "\\cite"
+      
+      
   # bar plot per OPEX
   - step: plot_bar_by_technology
     params:
-      stats_source_col: "efficiency"
+      stats_source_col: "Efficiency"
       value_col: "mean"
       error_col: "std"
       count_col: "count"
@@ -77,77 +98,77 @@ pipeline:
         rug_size: 30
         rug_alpha: 0.7
 
-  # 3) costruisci il grafo: pesi dalla media CAPEX (oppure metti count)
-  - step: build_flow_graph
-    params:
-      input_col: "Input"
-      technology_col: "Technology name"
-      output_col: "Output"
-      sector_col: "Sector"
-      token_separators: [";", ",", "|"]
-      weight_mode: "stats"             # "stats" | "column" | "uniform"
-      weight_stats_source_col: "CAPEX" # da ctx["stats"]["CAPEX"]
-      weight_stats_metric: "mean"      # oppure "count" se vuoi il numero di punti
-      weight_scale: 0.01          # <= divide per 100
-      weight_transform: "none"    # opzionale: "sqrt" o "log10"
-      min_weight: 0.0
+  # # 3) costruisci il grafo: pesi dalla media CAPEX (oppure metti count)
+  # - step: build_flow_graph
+  #   params:
+  #     input_col: "Input"
+  #     technology_col: "Technology name"
+  #     output_col: "Output"
+  #     sector_col: "Sector"
+  #     token_separators: [";", ",", "|"]
+  #     weight_mode: "stats"             # "stats" | "column" | "uniform"
+  #     weight_stats_source_col: "CAPEX" # da ctx["stats"]["CAPEX"]
+  #     weight_stats_metric: "mean"      # oppure "count" se vuoi il numero di punti
+  #     weight_scale: 0.01          # <= divide per 100
+  #     weight_transform: "none"    # opzionale: "sqrt" o "log10"
+  #     min_weight: 0.0
       
-  - step: build_carrier_graph
-    params:
-      input_col: "Input"
-      output_col: "Output"
-      weight_mode: "count"        # oppure: "stats" + stats_source_col/metric
-      min_weight: 1
+  # - step: build_carrier_graph
+  #   params:
+  #     input_col: "Input"
+  #     output_col: "Output"
+  #     weight_mode: "count"        # oppure: "stats" + stats_source_col/metric
+  #     min_weight: 1
 
-  - step: plot_carrier_networkx
-    params:
-      layout_mode: "sector_columns"
-      num_sector_cols: 6
-      sector_band_mode: "proportional"
-      sector_band_gap: 0.028
-      min_row_spacing: 0.10
-      adaptive_fig: true
-      dense_threshold: 16
-      height_per_node: 0.16
-      jitter_y: 0.004
-      hide_self_loops: true
+  # - step: plot_carrier_networkx
+  #   params:
+  #     layout_mode: "sector_columns"
+  #     num_sector_cols: 6
+  #     sector_band_mode: "proportional"
+  #     sector_band_gap: 0.028
+  #     min_row_spacing: 0.10
+  #     adaptive_fig: true
+  #     dense_threshold: 16
+  #     height_per_node: 0.16
+  #     jitter_y: 0.004
+  #     hide_self_loops: true
 
 
-  - step: plot_flow_sankey
-    params:
-      min_link_value: 0.1
-      top_links_per_source: 10
-      group_others: true
-      link_color_mode: "source"
-      order_by: "throughput"
-      wrap_labels: true
-      save_png: true
-      # out_dir: "C:\\path\\to\\out"
+  # - step: plot_flow_sankey
+  #   params:
+  #     min_link_value: 0.1
+  #     top_links_per_source: 10
+  #     group_others: true
+  #     link_color_mode: "source"
+  #     order_by: "throughput"
+  #     wrap_labels: true
+  #     save_png: true
+  #     # out_dir: "C:\\path\\to\\out"
 
-  - step: build_tech_similarity_graph
-    params:
-      technology_col: "Technology name"
-      sector_col: "Sector"
-      input_col: "Input"
-      output_col: "Output"
-      weight_mode: "count"     # oppure "jaccard"
-      min_weight: 1
+  # - step: build_tech_similarity_graph
+  #   params:
+  #     technology_col: "Technology name"
+  #     sector_col: "Sector"
+  #     input_col: "Input"
+  #     output_col: "Output"
+  #     weight_mode: "count"     # oppure "jaccard"
+  #     min_weight: 1
 
-  - step: plot_interactive_force_pyvis
-    params:
-      layout_scale: 2
-      min_node_distance_px: 60
-      repel_iters: 10
-      repel_strength: 0.4
+  # - step: plot_interactive_force_pyvis
+  #   params:
+  #     layout_scale: 2
+  #     min_node_distance_px: 60
+  #     repel_iters: 10
+  #     repel_strength: 0.4
 
-      # nodi più piccoli
-      node_size_min: 8
-      node_size_max: 24
-      node_font_size: 13
+  #     # nodi più piccoli
+  #     node_size_min: 8
+  #     node_size_max: 24
+  #     node_font_size: 13
 
-      # un po' più grande nel complesso
-      pos_scale_px: 520
-      canvas_height: "1000px"
+  #     # un po' più grande nel complesso
+  #     pos_scale_px: 520
+  #     canvas_height: "1000px"
 
 
 

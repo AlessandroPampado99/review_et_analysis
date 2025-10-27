@@ -24,6 +24,7 @@ import plotly.graph_objects as go
 from pyvis.network import Network
 import textwrap
 logger = logging.getLogger("pipeline")
+import json
 
 
 # --- utility ---
@@ -95,17 +96,189 @@ def assign_colors_by_technology(
 @step("assign_sector_colors")
 def assign_sector_colors(
     df, ctx,
-    sector_col: str = "Sector",
-    palette: str = "tab20",
-    seed: int = 42,
+    input_sector_col: str = "Input sector",
+    output_sector_col: str = "Output sector",
     **_,
 ):
-    """Assign a distinct color to each Sector and store in ctx['sector_colors']."""
-    sectors = sorted(s for s in df[sector_col].dropna().unique().tolist())
-    cmap = cm.get_cmap(palette, max(1, len(sectors)))
-    sector_colors = {s: mcolors.to_hex(cmap(i)) for i, s in enumerate(sectors)}
+    """
+    Assign fixed colors to standardized sectors (based on carriers), using both input/output columns.
+    If a sector is missing from the predefined palette, it gets a neutral gray color.
+    """
+    import matplotlib.colors as mcolors
+
+    # ---- gather all sectors from both columns ----
+    def _split(s):
+        if pd.isna(s):
+            return []
+        return [x.strip() for x in str(s).split(";") if x.strip()]
+
+    sectors = set()
+    for col in [input_sector_col, output_sector_col]:
+        if col in df.columns:
+            df[col].apply(lambda x: sectors.update(_split(x)))
+
+    # ---- fixed palette ----
+    fixed_palette = {
+        "Power": "#FFD700",           # Yellow
+        "Hydrogen": "#00FF00",        # Green
+        "Inorganics": "#8A2BE2",      # Violet (BlueViolet)
+        "CO2": "#FF00FF",             # Magenta
+        "Fuel Additives": "#00FFFF",  # Cyan
+        "Heat": "#FF0000",            # Red
+        "Organics": "#FFA500",        # Orange
+        "Fuel Derivatives": "#0000FF" # Blue
+    }
+
+    # ---- assign palette ----
+    sector_colors = {}
+    for s in sorted(sectors):
+        if s in fixed_palette:
+            sector_colors[s] = fixed_palette[s]
+        else:
+            # fallback: soft gray for unknowns
+            sector_colors[s] = mcolors.to_hex("0.7")  # ~#b3b3b3
+
     ctx["sector_colors"] = sector_colors
+
+    # optional: log for debug
+    logger.info(f"[assign_sector_colors] Assigned colors to {len(sector_colors)} sectors: {list(sector_colors.keys())}")
     return df, ctx
+
+
+# ---------- Build bib ------------
+
+@step("build_bibliography_from_excel")
+def build_bibliography_from_excel(
+    df: pd.DataFrame,
+    ctx: dict,
+    excel_path: str,
+    sheet: str = "bib_information",
+    title_col: str = "Categories",
+    authors_col: str = "Authors",
+    year_col: str = "Year",
+    journal_col: str = "Source title",
+    volume_col: str = "Volume",
+    issue_col: str = "Issue",
+    pages_start_col: str = "Page start",
+    pages_end_col: str = "Page end",
+    doi_col: str = "DOI",
+    url_col: str = "Link",
+    out_dir: str = "./out/bibliography",
+    bib_filename: str = "bibliography.bib",
+    **_,
+):
+    """
+    Read a 'bib_information' sheet from Excel, build a .bib file and
+    store a title->bibkey mapping in ctx['bib']['title_to_key'].
+    BibTeX keys are short: <FirstAuthor>_<FirstWordsOfTitle>.
+    """
+    import os, re, unicodedata
+    import pandas as pd
+
+    def _ensure_parent_dir(path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    try:
+        bib_df = pd.read_excel(excel_path, sheet_name=sheet)
+    except Exception as e:
+        raise RuntimeError(f"[build_bibliography_from_excel] Failed to read sheet '{sheet}': {e}")
+
+    # --- helpers ---
+    def _normalize(s: str) -> str:
+        if pd.isna(s):
+            return ""
+        s = str(s)
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        return s.strip()
+
+    def _slug(s: str) -> str:
+        s = _normalize(s)
+        s = re.sub(r"[^A-Za-z0-9\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s.replace(" ", "_")
+
+    def _first_author_surname(authors: str) -> str:
+        """Extract surname from first author entry like 'Pastore L.M.; de Santoli L.'"""
+        if not authors or pd.isna(authors):
+            return "Anon"
+        first = str(authors).split(";")[0].strip()
+        return first.split()[0] if first else "Anon"
+
+    def _first_title_words(title: str, n: int = 3) -> str:
+        """Take first n alphabetic words from title (skip digits/symbols)."""
+        if not title:
+            return "NoTitle"
+        words = re.findall(r"[A-Za-z]+", title)
+        words = [w.capitalize() for w in words[:n]]
+        return "_".join(words) if words else "Untitled"
+
+    # --- build keys and entries ---
+    used_keys = set()
+    title_to_key = {}
+    entries = []
+
+    for _, r in bib_df.iterrows():
+        title = _normalize(r.get(title_col))
+        if not title:
+            continue
+
+        authors = _normalize(r.get(authors_col))
+        surname = _first_author_surname(authors)
+        short_title = _first_title_words(title, n=3)
+
+        key_base = f"{surname}_{short_title}"
+        key = key_base
+        i = 2
+        while key in used_keys:
+            key = f"{key_base}_{i}"
+            i += 1
+        used_keys.add(key)
+        title_to_key[title] = key
+
+        # build bib entry
+        year = _normalize(r.get(year_col))
+        journal = _normalize(r.get(journal_col))
+        volume = _normalize(r.get(volume_col))
+        issue = _normalize(r.get(issue_col))
+        pstart = _normalize(r.get(pages_start_col))
+        pend = _normalize(r.get(pages_end_col))
+        doi = _normalize(r.get(doi_col))
+        url = _normalize(r.get(url_col))
+
+        fields = []
+        if title:   fields.append(f"  title = {{{title}}}")
+        if authors: fields.append(f"  author = {{{authors}}}")
+        if year:    fields.append(f"  year = {{{year}}}")
+        if journal: fields.append(f"  journal = {{{journal}}}")
+        if volume:  fields.append(f"  volume = {{{volume}}}")
+        if issue:   fields.append(f"  number = {{{issue}}}")
+        if pstart or pend:
+            pages = f"{pstart}-{pend}".strip("-")
+            fields.append(f"  pages = {{{pages}}}")
+        if doi:
+            fields.append(f"  doi = {{{doi}}}")
+        elif url:
+            fields.append(f"  howpublished = {{\\url{{{url}}}}}")
+
+        entry_type = "article" if journal else "misc"
+        entry = f"@{entry_type}{{{key},\n" + ",\n".join(fields) + "\n}\n"
+        entries.append(entry)
+
+    # --- write bib ---
+    base_out = ctx.get("base_out_dir", "./out")
+    out_dir = out_dir or base_out
+    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
+    bib_fp = os.path.join(out_dir, bib_filename)
+    with open(bib_fp, "w", encoding="utf-8") as f:
+        f.write("\n".join(entries))
+    logger.info(f"[build_bibliography_from_excel] Saved .bib with {len(entries)} entries: {bib_fp}")
+
+    ctx["bib"] = {"df": bib_df, "title_to_key": title_to_key, "bib_path": bib_fp}
+    ctx.setdefault("artifacts", []).append(bib_fp)
+    return df, ctx
+
+
 
 
 # ---------- Basic steps ----------
@@ -251,6 +424,205 @@ def stats_by_technology(
 
     # Otherwise passthrough original df
     return df, ctx
+
+
+# ---------- Table steps ----------
+
+@step("build_tech_summary_table")
+def build_tech_summary_table(
+    df: pd.DataFrame,
+    ctx: dict,
+
+    # columns
+    technology_col: str = "Technology name",
+    input_col: str = "Input",
+    output_col: str = "Output",
+    input_sector_col: str = "Input sector",
+    output_sector_col: str = "Output sector",
+    title_col: str = "Title",          # paper title column (in the main sheet)
+
+    # tokenization / normalization
+    token_separators: tuple = (";", ",", "|"),
+    strip_tokens: bool = True,
+    deduplicate_tokens: bool = True,
+    sort_tokens: bool = True,
+    joiner: str = "; ",
+
+    # output
+    out_dir: str = "./out/tech_tables",
+    csv_name: str = "tech_summary.csv",
+    tex_name: str = "tech_summary.tex",
+    long_csv_name: str = "tech_citations_long.csv",  # (tech, key[, title])
+
+    # LaTeX
+    latex_longtable: bool = True,
+    latex_caption: str = "Technology summary (inputs/outputs/sectors and references)",
+    latex_label: str = "tab:tech_summary",
+    column_widths: tuple = (3.2, 3.0, 2.6, 3.0, 2.8, 3.0),  # cm for p{..}
+
+    # citations
+    use_bib_citations: bool = True,   # if true and ctx['bib'] present, use \cite{...} instead of titles
+    cite_cmd: str = "\\cite",         # or \\citet, \\citep, etc.
+    **_,
+):
+    """
+    Build per-technology table with Input/Input sector/Output/Output sector and citations:
+    - If ctx['bib']['title_to_key'] exists and use_bib_citations=True, replace titles with \cite{keys}
+    - Otherwise, keep titles joined in a single cell.
+    Saves CSV + LaTeX, and an exploded long CSV (tech, key[, title]).
+    """
+    import os, re, json
+    import numpy as np
+    import pandas as pd
+
+    def _ensure_parent_dir(path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def _split_tokens(val) -> list:
+        if pd.isna(val):
+            return []
+        s = str(val)
+        if not token_separators:
+            return [s.strip()] if strip_tokens else [s]
+        patt = "|".join(map(re.escape, token_separators))
+        toks = [t.strip() if strip_tokens else t for t in re.split(patt, s)]
+        return [t for t in toks if t]
+
+    def _agg_tokens(series: pd.Series) -> str:
+        all_tokens = []
+        for v in series:
+            all_tokens.extend(_split_tokens(v))
+        if deduplicate_tokens:
+            all_tokens = list(dict.fromkeys(all_tokens))
+        if sort_tokens:
+            all_tokens = sorted(all_tokens)
+        return joiner.join(all_tokens)
+
+    def _latex_escape(s: str) -> str:
+        if not isinstance(s, str):
+            s = "" if pd.isna(s) else str(s)
+        repl = {
+            "&": r"\&", "%": r"\%", "$": r"\$", "#": r"\#",
+            "_": r"\_", "{": r"\{", "}": r"\}", "~": r"\textasciitilde{}",
+            "^": r"\textasciicircum{}", "\\": r"\textbackslash{}",
+        }
+        for k, v in repl.items():
+            s = s.replace(k, v)
+        return s
+
+    # required cols
+    req_cols = [technology_col, input_col, output_col, input_sector_col, output_sector_col]
+    missing = [c for c in req_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"[build_tech_summary_table] Missing columns: {missing}")
+    has_title = (title_col in df.columns)
+
+    # citation mapping from ctx (optional)
+    bib_map = {}
+    if use_bib_citations:
+        bib_ctx = ctx.get("bib", {})
+        bib_map = bib_ctx.get("title_to_key", {}) or {}
+
+    grp = df.groupby(technology_col, dropna=False)
+    rows = []
+    long_rows = []
+
+    for tech, sub in grp:
+        inputs        = _agg_tokens(sub[input_col])
+        input_secs    = _agg_tokens(sub[input_sector_col])
+        outputs       = _agg_tokens(sub[output_col])
+        output_secs   = _agg_tokens(sub[output_sector_col])
+
+        # titles -> citations if map available
+        if has_title:
+            titles_unique = sub[title_col].dropna().astype(str).unique().tolist()
+            if sort_tokens:
+                titles_unique = sorted(titles_unique)
+            if use_bib_citations and bib_map:
+                keys = [bib_map[t] for t in titles_unique if t in bib_map]
+                cite_cell = f"{cite_cmd}{{{','.join(keys)}}}" if keys else ""
+                titles_cell = cite_cell
+                # long rows
+                for t in titles_unique:
+                    k = bib_map.get(t, "")
+                    long_rows.append({technology_col: tech, "key": k, "title": t})
+            else:
+                titles_cell = joiner.join(titles_unique)
+                for t in titles_unique:
+                    long_rows.append({technology_col: tech, "key": "", "title": t})
+        else:
+            titles_cell = ""
+
+        rows.append({
+            technology_col: tech,
+            "Input": inputs,
+            "Input sector": input_secs,
+            "Output": outputs,
+            "Output sector": output_secs,
+            "Citations": titles_cell
+        })
+
+    summary_df = pd.DataFrame(rows)
+
+    # CSV
+    base_out = ctx.get("base_out_dir", "./out")
+    out_dir = out_dir or base_out
+    _ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
+    csv_fp = os.path.join(out_dir, csv_name)
+    summary_df.to_csv(csv_fp, index=False)
+    logger.info(f"[build_tech_summary_table] Saved CSV: {csv_fp}")
+    ctx.setdefault("artifacts", []).append(csv_fp)
+
+    # LONG CSV
+    if long_rows:
+        long_df = pd.DataFrame(long_rows).drop_duplicates()
+        long_csv_fp = os.path.join(out_dir, long_csv_name)
+        long_df.to_csv(long_csv_fp, index=False)
+        logger.info(f"[build_tech_summary_table] Saved long CSV: {long_csv_fp}")
+        ctx["artifacts"].append(long_csv_fp)
+
+    # LaTeX (escape all *except* Citations which may contain \cite{})
+    tech_col = technology_col
+    cols_order = [tech_col, "Input", "Input sector", "Output", "Output sector", "Citations"]
+    tex_fp = os.path.join(out_dir, tex_name)
+
+    ld = summary_df.copy()
+    for c in cols_order:
+        if c != "Citations":
+            ld[c] = ld[c].astype(str).apply(_latex_escape)
+        else:
+            ld[c] = ld[c].fillna("")
+
+    w = column_widths
+    colspec = f"p{{{w[0]}cm}} p{{{w[1]}cm}} p{{{w[2]}cm}} p{{{w[3]}cm}} p{{{w[4]}cm}} p{{{w[5]}cm}}"
+
+    with open(tex_fp, "w", encoding="utf-8") as f:
+        if latex_longtable:
+            f.write(f"\\begin{{longtable}}{{{colspec}}}\n")
+            f.write(f"\\caption{{{_latex_escape(latex_caption)}}}\\label{{{_latex_escape(latex_label)}}}\\\\\n")
+            f.write("\\hline\n")
+            f.write("Technology & Input & Input sector & Output & Output sector & References \\\\\n")
+            f.write("\\hline\\endfirsthead\n")
+            f.write("\\hline\n")
+            f.write("Technology & Input & Input sector & Output & Output sector & References \\\\\n")
+            f.write("\\hline\\endhead\n")
+            for _, r in ld[cols_order].iterrows():
+                f.write(" & ".join(str(r[c]) for c in cols_order) + " \\\\\n")
+            f.write("\\hline\n\\end{longtable}\n")
+        else:
+            # standard tabular
+            f.write("\\begin{table}[ht]\n\\centering\n")
+            f.write(f"\\caption{{{_latex_escape(latex_caption)}}}\\label{{{_latex_escape(latex_label)}}}\n")
+            f.write(f"\\begin{{tabular}}{{{colspec}}}\n\\hline\n")
+            f.write("Technology & Input & Input sector & Output & Output sector & References \\\\\n\\hline\n")
+            for _, r in ld[cols_order].iterrows():
+                f.write(" & ".join(str(r[c]) for c in cols_order) + " \\\\\n")
+            f.write("\\hline\n\\end{tabular}\n\\end{table}\n")
+
+    logger.info(f"[build_tech_summary_table] Saved LaTeX: {tex_fp}")
+    ctx["artifacts"].append(tex_fp)
+
+    return summary_df, ctx
 
 
 
